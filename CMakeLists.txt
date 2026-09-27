@@ -64,6 +64,11 @@ target_sources(
     LoopBridgeDesktop
     PRIVATE
         Desktop/Main.cpp
+        Desktop/GmailClient.h
+        Desktop/GmailClient.cpp
+        Desktop/LoopItem.h
+        Desktop/MetadataParser.h
+        Desktop/MetadataParser.cpp
 )
 
 target_compile_features(
@@ -93,5 +98,48 @@ target_link_libraries(
         juce::juce_audio_utils
         juce::juce_audio_formats
         juce::juce_audio_devices
+        juce::juce_cryptography
         signalsmith-stretch
+        ws2_32
+)
+
+# ------------------------------------------------------------
+# Metadata parser tests
+# ------------------------------------------------------------
+
+juce_add_console_app(
+    LoopBridgeMetadataTests
+    PRODUCT_NAME "LoopBridge Metadata Tests"
+)
+
+juce_generate_juce_header(
+    LoopBridgeMetadataTests
+)
+
+target_sources(
+    LoopBridgeMetadataTests
+    PRIVATE
+        Desktop/MetadataParserTests.cpp
+        Desktop/MetadataParser.cpp
+        Desktop/MetadataParser.h
+        Desktop/LoopItem.h
+)
+
+target_compile_features(
+    LoopBridgeMetadataTests
+    PRIVATE
+        cxx_std_17
+)
+
+target_compile_definitions(
+    LoopBridgeMetadataTests
+    PRIVATE
+        JUCE_WEB_BROWSER=0
+        JUCE_USE_CURL=0
+)
+
+target_link_libraries(
+    LoopBridgeMetadataTests
+    PRIVATE
+        juce::juce_core
 )
