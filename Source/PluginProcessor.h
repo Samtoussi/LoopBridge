@@ -3,7 +3,9 @@
 #include <JuceHeader.h>
 #include <atomic>
 
-class LoopBridgeAudioProcessor : public juce::AudioProcessor
+class LoopBridgeAudioProcessor
+    : public juce::AudioProcessor,
+      private juce::Timer
 {
 public:
     LoopBridgeAudioProcessor();
@@ -48,7 +50,13 @@ public:
     double getHostBpm() const;
 
 private:
+    void timerCallback() override;
+
     std::atomic<double> hostBpm { 0.0 };
+    std::atomic<bool> hostPlaying { false };
+    std::atomic<double> hostPpq { 0.0 };
+
+    juce::DatagramSocket bridgeSocket { false };
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(
         LoopBridgeAudioProcessor

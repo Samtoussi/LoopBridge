@@ -13,7 +13,7 @@ juce_add_plugin(LoopBridge
     FORMATS VST3
     PRODUCT_NAME "LoopBridge"
 
-    IS_SYNTH FALSE
+    IS_SYNTH TRUE
     NEEDS_MIDI_INPUT FALSE
     NEEDS_MIDI_OUTPUT FALSE
     IS_MIDI_EFFECT FALSE
@@ -41,4 +41,40 @@ target_compile_definitions(LoopBridge
 target_link_libraries(LoopBridge
     PRIVATE
         juce::juce_audio_utils
+)
+
+juce_add_gui_app(LoopBridgeDesktop
+    PRODUCT_NAME "LoopBridge"
+    COMPANY_NAME "Versa"
+    BUNDLE_ID "com.versa.loopbridge.desktop"
+)
+
+juce_generate_juce_header(LoopBridgeDesktop)
+
+target_sources(LoopBridgeDesktop
+    PRIVATE
+        Desktop/Main.cpp
+)
+
+target_compile_features(
+    LoopBridgeDesktop
+    PRIVATE
+        cxx_std_17
+)
+
+target_compile_definitions(
+    LoopBridgeDesktop
+    PRIVATE
+        JUCE_WEB_BROWSER=0
+        JUCE_USE_CURL=0
+)
+
+target_link_libraries(
+    LoopBridgeDesktop
+    PRIVATE
+        juce::juce_gui_extra
+        juce::juce_events
+        juce::juce_audio_utils
+        juce::juce_audio_formats
+        juce::juce_audio_devices
 )

@@ -16,10 +16,12 @@ LoopBridgeAudioProcessor::LoopBridgeAudioProcessor()
               )
       )
 {
+    startTimer(100);
 }
 
 LoopBridgeAudioProcessor::~LoopBridgeAudioProcessor()
 {
+    stopTimer();
 }
 
 const juce::String LoopBridgeAudioProcessor::getName() const
@@ -113,11 +115,49 @@ void LoopBridgeAudioProcessor::processBlock(
             {
                 hostBpm.store(*bpm);
             }
+
+            hostPlaying.store(
+                position->getIsPlaying()
+            );
+
+            if (auto ppq = position->getPpqPosition())
+            {
+                hostPpq.store(*ppq);
+            }
         }
     }
 
-    // V0 feasibility build:
     // Audio passes through unchanged.
+    // Host state is captured here, but networking
+    // remains outside the audio thread.
+}
+
+void LoopBridgeAudioProcessor::timerCallback()
+{
+    const double bpm = hostBpm.load();
+
+    if (bpm <= 0.0)
+        return;
+
+    const bool playing = hostPlaying.load();
+    const double ppq = hostPpq.load();
+
+    const juce::String message =
+        "BPM:"
+        + juce::String(bpm, 2)
+        + ";PLAYING:"
+        + (playing ? "1" : "0")
+        + ";PPQ:"
+        + juce::String(ppq, 3);
+
+    bridgeSocket.write(
+        "127.0.0.1",
+        49152,
+        message.toRawUTF8(),
+        static_cast<int>(
+            message.getNumBytesAsUTF8()
+        )
+    );
 }
 
 double LoopBridgeAudioProcessor::getHostBpm() const
