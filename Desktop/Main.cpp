@@ -1,28 +1,45 @@
 #include <JuceHeader.h>
-#include <cmath>
+#include <signalsmith-stretch/signalsmith-stretch.h>
 
-class LoopBridgeWindow : public juce::DocumentWindow
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <future>
+#include <limits>
+#include <memory>
+#include <vector>
+
+class LoopBridgeWindow
+    : public juce::DocumentWindow
 {
 public:
     LoopBridgeWindow()
         : DocumentWindow(
               "LoopBridge",
-              juce::Colour::fromRGB(20, 20, 24),
-              DocumentWindow::allButtons
-          )
+              juce::Colour::fromRGB(
+                  20,
+                  20,
+                  24),
+              DocumentWindow::allButtons)
     {
         setUsingNativeTitleBar(true);
         setResizable(false, false);
 
-        setContentOwned(new MainComponent(), true);
+        setContentOwned(
+            new MainComponent(),
+            true);
 
-        centreWithSize(560, 470);
+        centreWithSize(
+            620,
+            580);
+
         setVisible(true);
     }
 
     void closeButtonPressed() override
     {
-        juce::JUCEApplication::getInstance()
+        juce::JUCEApplication::
+            getInstance()
             ->systemRequestedQuit();
     }
 
@@ -33,58 +50,84 @@ private:
     {
     public:
         MainComponent()
-            : socket(false)
+            : receiveSocket(false),
+              sendSocket(false)
         {
-            listening = socket.bindToPort(
-                49152,
-                "127.0.0.1"
-            );
+            listening =
+                receiveSocket.bindToPort(
+                    49152,
+                    "127.0.0.1");
 
-            formatManager.registerBasicFormats();
+            formatManager
+                .registerBasicFormats();
 
-            loadButton.setButtonText("Load WAV");
-            playButton.setButtonText("Play");
-            stopButton.setButtonText("Stop");
+            loadButton.setButtonText(
+                "Load 100 BPM WAV");
 
-            addAndMakeVisible(loadButton);
-            addAndMakeVisible(playButton);
-            addAndMakeVisible(stopButton);
+            playButton.setButtonText(
+                "Play");
+
+            stopButton.setButtonText(
+                "Stop");
+
+            bridgeButton.setButtonText(
+                "BRIDGE ON");
+
+            addAndMakeVisible(
+                loadButton);
+
+            addAndMakeVisible(
+                playButton);
+
+            addAndMakeVisible(
+                stopButton);
+
+            addAndMakeVisible(
+                bridgeButton);
 
             playButton.setEnabled(false);
             stopButton.setEnabled(false);
 
-            loadButton.onClick = [this]
-            {
-                chooseAudioFile();
-            };
+            loadButton.onClick =
+                [this]
+                {
+                    chooseAudioFile();
+                };
 
-            playButton.onClick = [this]
-            {
-                queuePreview();
-            };
+            playButton.onClick =
+                [this]
+                {
+                    startSoloPreview();
+                };
 
-            stopButton.onClick = [this]
-            {
-                cancelQueuedPreview();
+            stopButton.onClick =
+                [this]
+                {
+                    stopSoloPreview();
+                };
 
-                transportSource.stop();
-                transportSource.setPosition(0.0);
+            bridgeButton.onClick =
+                [this]
+                {
+                    bridgeEnabled =
+                        !bridgeEnabled;
 
-                previewPlaying = false;
+                    bridgeButton.setButtonText(
+                        bridgeEnabled
+                            ? "BRIDGE ON"
+                            : "BRIDGE OFF");
 
-                playButton.setEnabled(
-                    readerSource != nullptr
-                );
+                    sendBridgeState();
 
-                stopButton.setEnabled(false);
+                    repaint();
+                };
 
-                repaint();
-            };
+            // Desktop audio is ONLY used
+            // for manual solo preview.
+            setAudioChannels(
+                0,
+                2);
 
-            setAudioChannels(0, 2);
-
-            // Faster UI/control timer than before.
-            // UDP itself still arrives at the VST's current rate.
             startTimer(5);
         }
 
@@ -92,256 +135,379 @@ private:
         {
             stopTimer();
 
-            cancelQueuedPreview();
-
-            transportSource.stop();
-            transportSource.setSource(nullptr);
+            if (previewBuildFuture.valid())
+            {
+                previewBuildFuture.wait();
+            }
 
             shutdownAudio();
         }
 
         void prepareToPlay(
-            int samplesPerBlockExpected,
-            double sampleRate
-        ) override
+            int,
+            double newSampleRate) override
         {
-            transportSource.prepareToPlay(
-                samplesPerBlockExpected,
-                sampleRate
-            );
-        }
+            deviceSampleRate =
+                newSampleRate;
 
-        void getNextAudioBlock(
-            const juce::AudioSourceChannelInfo&
-                bufferToFill
-        ) override
-        {
-            if (readerSource == nullptr)
-            {
-                bufferToFill.clearActiveBufferRegion();
-                return;
-            }
+            rebuildSoloBuffer();
 
-            transportSource.getNextAudioBlock(
-                bufferToFill
-            );
+            repaint();
         }
 
         void releaseResources() override
         {
-            transportSource.releaseResources();
         }
 
-        void paint(juce::Graphics& g) override
+        void getNextAudioBlock(
+            const juce::AudioSourceChannelInfo&
+                info) override
+        {
+            info.clearActiveBufferRegion();
+
+            const juce::ScopedLock lock(
+                audioLock);
+
+            // Bridge audio is rendered by the VST.
+            //
+            // Desktop audio callback is ONLY
+            // for the manual Play button.
+            if (!soloPlaying)
+                return;
+
+            if (soloBuffer.getNumSamples() <= 0)
+                return;
+
+            const int loopSamples =
+                soloBuffer.getNumSamples();
+
+            const int sourceChannels =
+                soloBuffer.getNumChannels();
+
+            const int outputChannels =
+                info.buffer->getNumChannels();
+
+            int destinationOffset = 0;
+            int remaining =
+                info.numSamples;
+
+            while (remaining > 0)
+            {
+                if (soloPlaybackPosition
+                    >= loopSamples)
+                {
+                    soloPlaybackPosition = 0;
+                }
+
+                const int available =
+                    loopSamples
+                    - soloPlaybackPosition;
+
+                const int samplesToCopy =
+                    std::min(
+                        remaining,
+                        available);
+
+                for (int channel = 0;
+                     channel < outputChannels;
+                     ++channel)
+                {
+                    const int sourceChannel =
+                        std::min(
+                            channel,
+                            sourceChannels - 1);
+
+                    info.buffer->copyFrom(
+                        channel,
+                        info.startSample
+                            + destinationOffset,
+                        soloBuffer,
+                        sourceChannel,
+                        soloPlaybackPosition,
+                        samplesToCopy);
+                }
+
+                soloPlaybackPosition +=
+                    samplesToCopy;
+
+                destinationOffset +=
+                    samplesToCopy;
+
+                remaining -=
+                    samplesToCopy;
+            }
+        }
+
+        void paint(
+            juce::Graphics& g) override
         {
             g.fillAll(
-                juce::Colour::fromRGB(20, 20, 24)
-            );
+                juce::Colour::fromRGB(
+                    20,
+                    20,
+                    24));
 
-            // Title
-            g.setColour(juce::Colours::white);
+            g.setColour(
+                juce::Colours::white);
 
             g.setFont(
                 juce::Font(
                     juce::FontOptions(
                         32.0f,
-                        juce::Font::bold
-                    )
-                )
-            );
+                        juce::Font::bold)));
 
             g.drawFittedText(
                 "LOOPBRIDGE",
                 0,
-                25,
+                20,
                 getWidth(),
                 45,
                 juce::Justification::centred,
-                1
-            );
+                1);
 
-            // Bridge status
             g.setFont(
                 juce::Font(
-                    juce::FontOptions(15.0f)
-                )
-            );
+                    juce::FontOptions(
+                        15.0f)));
 
             g.setColour(
                 listening
                     ? juce::Colours::lightgreen
-                    : juce::Colours::red
-            );
+                    : juce::Colours::red);
 
             g.drawFittedText(
                 listening
                     ? "LISTENING"
                     : "PORT ERROR",
                 0,
-                75,
+                67,
                 getWidth(),
                 25,
                 juce::Justification::centred,
-                1
-            );
+                1);
 
-            // BPM
-            g.setColour(juce::Colours::white);
+            g.setColour(
+                juce::Colours::white);
 
             g.setFont(
                 juce::Font(
                     juce::FontOptions(
                         38.0f,
-                        juce::Font::bold
-                    )
-                )
-            );
+                        juce::Font::bold)));
 
             const auto bpmText =
                 hostBpm > 0.0
-                    ? juce::String(hostBpm, 2)
+                    ? juce::String(
+                          hostBpm,
+                          2)
                     : "--";
 
             g.drawFittedText(
                 bpmText,
                 0,
-                105,
+                95,
                 getWidth(),
                 50,
                 juce::Justification::centred,
-                1
-            );
+                1);
 
             g.setColour(
-                juce::Colours::white.withAlpha(0.55f)
-            );
+                juce::Colours::white
+                    .withAlpha(0.55f));
 
             g.setFont(
                 juce::Font(
-                    juce::FontOptions(14.0f)
-                )
-            );
+                    juce::FontOptions(
+                        14.0f)));
 
             g.drawFittedText(
                 "HOST BPM",
                 0,
-                153,
+                140,
                 getWidth(),
                 22,
                 juce::Justification::centred,
-                1
-            );
+                1);
 
-            // FL transport
             g.setColour(
                 hostPlaying
                     ? juce::Colours::lightgreen
-                    : juce::Colours::white.withAlpha(0.55f)
-            );
+                    : juce::Colours::white
+                          .withAlpha(0.55f));
 
             g.setFont(
                 juce::Font(
                     juce::FontOptions(
                         14.0f,
-                        juce::Font::bold
-                    )
-                )
-            );
+                        juce::Font::bold)));
 
             g.drawFittedText(
                 hostPlaying
                     ? "FL PLAYING"
                     : "FL STOPPED",
                 0,
-                185,
+                170,
                 getWidth(),
                 25,
                 juce::Justification::centred,
-                1
-            );
+                1);
 
-            // PPQ
             g.setColour(
-                juce::Colours::white.withAlpha(0.75f)
-            );
+                juce::Colours::white
+                    .withAlpha(0.75f));
 
             g.setFont(
                 juce::Font(
-                    juce::FontOptions(14.0f)
-                )
-            );
+                    juce::FontOptions(
+                        14.0f)));
 
             g.drawFittedText(
                 "PPQ: "
                     + juce::String(
                         getEstimatedPpq(),
-                        3
-                    ),
+                        3),
                 0,
-                215,
+                198,
                 getWidth(),
+                22,
+                juce::Justification::centred,
+                1);
+
+            juce::String sourceText =
+                "SOURCE: 100 BPM / 4 BARS";
+
+            if (hostBpm > 0.0)
+            {
+                sourceText +=
+                    "  ->  HOST: "
+                    + juce::String(
+                        hostBpm,
+                        0)
+                    + " BPM";
+            }
+
+            g.setColour(
+                juce::Colours::white
+                    .withAlpha(0.65f));
+
+            g.drawFittedText(
+                sourceText,
+                0,
+                225,
+                getWidth(),
+                22,
+                juce::Justification::centred,
+                1);
+
+            g.setColour(
+                juce::Colours::orange);
+
+            g.setFont(
+                juce::Font(
+                    juce::FontOptions(
+                        14.0f,
+                        juce::Font::bold)));
+
+            const juce::String flSrText =
+                hostSampleRate > 0.0
+                    ? juce::String(
+                          hostSampleRate,
+                          0)
+                          + " Hz"
+                    : "--";
+
+            const juce::String fileSrText =
+                sourceSampleRate > 0.0
+                    ? juce::String(
+                          sourceSampleRate,
+                          0)
+                          + " Hz"
+                    : "--";
+
+            const juce::String deviceSrText =
+                deviceSampleRate > 0.0
+                    ? juce::String(
+                          deviceSampleRate,
+                          0)
+                          + " Hz"
+                    : "--";
+
+            g.drawFittedText(
+                "FL SR: "
+                    + flSrText
+                    + "   |   FILE SR: "
+                    + fileSrText
+                    + "   |   DEVICE SR: "
+                    + deviceSrText,
+                15,
+                255,
+                getWidth() - 30,
                 25,
                 juce::Justification::centred,
-                1
-            );
+                1);
 
-            // Preview status
             g.setFont(
                 juce::Font(
                     juce::FontOptions(
                         13.0f,
-                        juce::Font::bold
-                    )
-                )
-            );
+                        juce::Font::bold)));
 
-            if (previewQueued)
+            if (stretching)
             {
                 g.setColour(
-                    juce::Colours::orange
-                );
+                    juce::Colours::orange);
 
                 g.drawFittedText(
-                    "PREVIEW QUEUED -> BEAT "
-                        + juce::String(
-                            targetPpq,
-                            0
-                        ),
+                    "PREPARING NEW BPM...",
                     0,
-                    242,
+                    287,
                     getWidth(),
                     22,
                     juce::Justification::centred,
-                    1
-                );
+                    1);
             }
-            else if (previewPlaying)
+            else if (soloPlaying)
             {
                 g.setColour(
-                    juce::Colours::lightgreen
-                );
+                    juce::Colours::lightgreen);
 
                 g.drawFittedText(
-                    "PREVIEW PLAYING",
+                    "SOLO PREVIEW / ORIGINAL 100 BPM",
                     0,
-                    242,
+                    287,
                     getWidth(),
                     22,
                     juce::Justification::centred,
-                    1
-                );
+                    1);
+            }
+            else if (hostPreviewReady)
+            {
+                g.setColour(
+                    bridgeEnabled
+                        ? juce::Colours::lightgreen
+                        : juce::Colours::white
+                              .withAlpha(0.55f));
+
+                g.drawFittedText(
+                    bridgeEnabled
+                        ? "HOST PREVIEW -> FL MIXER"
+                        : "BRIDGE DISCONNECTED",
+                    0,
+                    287,
+                    getWidth(),
+                    22,
+                    juce::Justification::centred,
+                    1);
             }
 
-            // Loaded file
             g.setColour(
-                juce::Colours::white.withAlpha(0.75f)
-            );
+                juce::Colours::white
+                    .withAlpha(0.75f));
 
             g.setFont(
                 juce::Font(
-                    juce::FontOptions(14.0f)
-                )
-            );
+                    juce::FontOptions(
+                        14.0f)));
 
             const juce::String fileText =
                 loadedFileName.isEmpty()
@@ -351,71 +517,157 @@ private:
             g.drawFittedText(
                 fileText,
                 30,
-                275,
+                320,
                 getWidth() - 60,
                 30,
                 juce::Justification::centred,
-                1
-            );
+                1);
+
+            if (sourceBuffer.getNumSamples() > 0
+                && sourceSampleRate > 0.0)
+            {
+                const double fileSeconds =
+                    sourceBuffer.getNumSamples()
+                    / sourceSampleRate;
+
+                const double musicalSeconds =
+                    loopBeats
+                    * 60.0
+                    / sourceBpm;
+
+                juce::String lengthText =
+                    "File: "
+                    + juce::String(
+                        fileSeconds,
+                        3)
+                    + "s / Musical: "
+                    + juce::String(
+                        musicalSeconds,
+                        3)
+                    + "s";
+
+                if (hostPreviewBuffer
+                        .getNumSamples()
+                    > 0
+                    && stretchedForHostSampleRate
+                           > 0.0)
+                {
+                    const double
+                        stretchedSeconds =
+                            hostPreviewBuffer
+                                .getNumSamples()
+                            / stretchedForHostSampleRate;
+
+                    lengthText +=
+                        " -> "
+                        + juce::String(
+                            stretchedSeconds,
+                            3)
+                        + "s";
+                }
+
+                g.setColour(
+                    juce::Colours::white
+                        .withAlpha(0.5f));
+
+                g.drawFittedText(
+                    lengthText,
+                    0,
+                    350,
+                    getWidth(),
+                    22,
+                    juce::Justification::centred,
+                    1);
+            }
         }
 
         void resized() override
         {
-            const int buttonWidth = 120;
-            const int buttonHeight = 38;
+            const int buttonWidth = 150;
+            const int buttonHeight = 40;
             const int gap = 12;
 
             const int totalWidth =
-                buttonWidth * 3 + gap * 2;
+                buttonWidth * 3
+                + gap * 2;
 
             const int startX =
-                (getWidth() - totalWidth) / 2;
+                (getWidth()
+                 - totalWidth)
+                / 2;
 
-            const int y = 335;
+            const int y = 410;
 
             loadButton.setBounds(
                 startX,
                 y,
                 buttonWidth,
-                buttonHeight
-            );
+                buttonHeight);
 
             playButton.setBounds(
-                startX + buttonWidth + gap,
+                startX
+                    + buttonWidth
+                    + gap,
                 y,
                 buttonWidth,
-                buttonHeight
-            );
+                buttonHeight);
 
             stopButton.setBounds(
                 startX
-                    + (buttonWidth + gap) * 2,
+                    + (buttonWidth + gap)
+                          * 2,
                 y,
                 buttonWidth,
-                buttonHeight
-            );
+                buttonHeight);
+
+            bridgeButton.setBounds(
+                (getWidth() - 180) / 2,
+                470,
+                180,
+                40);
         }
 
     private:
+        static constexpr double sourceBpm =
+            100.0;
+
+        static constexpr double loopBeats =
+            16.0;
+
+        static constexpr double
+            previewDebounceMs = 150.0;
+
+        struct HostPreviewBuildResult
+        {
+            juce::AudioBuffer<float>
+                buffer;
+
+            double bpm = 0.0;
+            double sampleRate = 0.0;
+
+            bool success = false;
+        };
+
         void chooseAudioFile()
         {
             fileChooser =
-                std::make_unique<juce::FileChooser>(
-                    "Choose an audio loop",
+                std::make_unique<
+                    juce::FileChooser>(
+                    "Choose a 100 BPM / 4 bar WAV",
                     juce::File{},
-                    "*.wav"
-                );
+                    "*.wav");
 
             const auto flags =
-                juce::FileBrowserComponent::openMode
+                juce::FileBrowserComponent::
+                    openMode
                 | juce::FileBrowserComponent::
                       canSelectFiles;
 
             fileChooser->launchAsync(
                 flags,
                 [this](
-                    const juce::FileChooser& chooser
-                )
+                    const juce::FileChooser&
+                        chooser)
                 {
                     const auto file =
                         chooser.getResult();
@@ -424,104 +676,597 @@ private:
                         return;
 
                     loadAudioFile(file);
-                }
-            );
+                });
         }
 
         void loadAudioFile(
-            const juce::File& file
-        )
+            const juce::File& file)
         {
-            auto* reader =
-                formatManager.createReaderFor(file);
+            std::unique_ptr<
+                juce::AudioFormatReader>
+                reader(
+                    formatManager
+                        .createReaderFor(
+                            file));
 
             if (reader == nullptr)
                 return;
 
-            auto newSource =
-                std::make_unique<
-                    juce::AudioFormatReaderSource
-                >(
-                    reader,
-                    true
-                );
+            stopSoloPreview();
 
-            cancelQueuedPreview();
+            sourceSampleRate =
+                reader->sampleRate;
 
-            transportSource.stop();
-            transportSource.setSource(nullptr);
+            const int channels =
+                static_cast<int>(
+                    reader->numChannels);
 
-            readerSource.reset();
+            const int64 totalSamples64 =
+                reader->lengthInSamples;
 
-            transportSource.setSource(
-                newSource.get(),
+            if (totalSamples64 <= 0
+                || totalSamples64
+                    > std::numeric_limits<int>::
+                          max())
+            {
+                return;
+            }
+
+            const int totalSamples =
+                static_cast<int>(
+                    totalSamples64);
+
+            sourceBuffer.setSize(
+                channels,
+                totalSamples);
+
+            reader->read(
+                &sourceBuffer,
                 0,
-                nullptr,
-                reader->sampleRate
-            );
+                totalSamples,
+                0,
+                true,
+                true);
 
-            readerSource = std::move(newSource);
+            const double
+                musicalDurationSeconds =
+                    loopBeats
+                    * 60.0
+                    / sourceBpm;
+
+            sourceMusicalSamples =
+                std::min(
+                    sourceBuffer
+                        .getNumSamples(),
+                    static_cast<int>(
+                        std::llround(
+                            musicalDurationSeconds
+                            * sourceSampleRate)));
 
             loadedFileName =
                 file.getFileName();
 
-            previewPlaying = false;
+            rebuildSoloBuffer();
 
-            playButton.setEnabled(true);
-            stopButton.setEnabled(false);
+            hostPreviewReady = false;
+
+            if (hostBpm > 0.0
+                && hostSampleRate > 0.0)
+            {
+                scheduleHostPreviewBuild(
+                    true);
+            }
+
+            playButton.setEnabled(
+                sourceMusicalSamples > 0);
 
             repaint();
         }
 
-        void queuePreview()
+        void rebuildSoloBuffer()
         {
-            if (readerSource == nullptr)
-                return;
-
-            transportSource.stop();
-            transportSource.setPosition(0.0);
-
-            previewPlaying = false;
-
-            // If FL isn't running, preserve the old behaviour:
-            // play immediately.
-            if (!hostPlaying || hostBpm <= 0.0)
+            if (sourceMusicalSamples <= 0
+                || sourceSampleRate <= 0.0
+                || deviceSampleRate <= 0.0)
             {
-                startPreviewNow();
                 return;
             }
 
-            const double currentPpq =
-                getEstimatedPpq();
+            const int channels =
+                sourceBuffer
+                    .getNumChannels();
 
-            // Queue for the next whole beat.
-            targetPpq =
-                std::floor(currentPpq) + 1.0;
+            const int outputSamples =
+                std::max(
+                    1,
+                    static_cast<int>(
+                        std::llround(
+                            sourceMusicalSamples
+                            * deviceSampleRate
+                            / sourceSampleRate)));
 
-            // Avoid an almost-zero wait if the click happens
-            // essentially on the beat.
-            if ((targetPpq - currentPpq) < 0.01)
-                targetPpq += 1.0;
+            juce::AudioBuffer<float>
+                newSoloBuffer;
 
-            previewQueued = true;
+            newSoloBuffer.setSize(
+                channels,
+                outputSamples);
 
-            playButton.setEnabled(false);
-            stopButton.setEnabled(true);
+            const double ratio =
+                sourceSampleRate
+                / deviceSampleRate;
+
+            for (int channel = 0;
+                 channel < channels;
+                 ++channel)
+            {
+                juce::LagrangeInterpolator
+                    interpolator;
+
+                interpolator.process(
+                    ratio,
+                    sourceBuffer
+                        .getReadPointer(
+                            channel),
+                    newSoloBuffer
+                        .getWritePointer(
+                            channel),
+                    outputSamples);
+            }
+
+            {
+                const juce::ScopedLock lock(
+                    audioLock);
+
+                soloBuffer =
+                    std::move(
+                        newSoloBuffer);
+
+                soloPlaybackPosition = 0;
+            }
+        }
+
+        void scheduleHostPreviewBuild(
+            bool immediate)
+        {
+            if (sourceMusicalSamples <= 0
+                || sourceSampleRate <= 0.0
+                || hostSampleRate <= 0.0
+                || hostBpm <= 0.0)
+            {
+                return;
+            }
+
+            pendingPreviewBpm =
+                hostBpm;
+
+            pendingPreviewSampleRate =
+                hostSampleRate;
+
+            previewBuildRequestedMs =
+                juce::Time::
+                    getMillisecondCounterHiRes();
+
+            previewBuildPending = true;
+
+            stretching = true;
+
+            if (immediate
+                && !previewBuildRunning)
+            {
+                startPendingPreviewBuild();
+            }
 
             repaint();
         }
 
-        void startPreviewNow()
+        void startPendingPreviewBuild()
         {
-            if (readerSource == nullptr)
+            if (previewBuildRunning
+                || !previewBuildPending)
+            {
+                return;
+            }
+
+            if (sourceMusicalSamples <= 0
+                || sourceSampleRate <= 0.0
+                || pendingPreviewBpm <= 0.0
+                || pendingPreviewSampleRate <= 0.0)
+            {
+                previewBuildPending = false;
+                stretching = false;
+                return;
+            }
+
+            const double targetBpm =
+                pendingPreviewBpm;
+
+            const double targetSampleRate =
+                pendingPreviewSampleRate;
+
+            juce::AudioBuffer<float>
+                sourceSnapshot;
+
+            sourceSnapshot.makeCopyOf(
+                sourceBuffer);
+
+            const int musicalSamples =
+                sourceMusicalSamples;
+
+            const double sourceRate =
+                sourceSampleRate;
+
+            previewBuildPending = false;
+            previewBuildRunning = true;
+
+            previewBuildFuture =
+                std::async(
+                    std::launch::async,
+                    [
+                        sourceSnapshot =
+                            std::move(
+                                sourceSnapshot),
+                        musicalSamples,
+                        sourceRate,
+                        targetBpm,
+                        targetSampleRate
+                    ]() mutable
+                    {
+                        HostPreviewBuildResult
+                            result;
+
+                        result.bpm =
+                            targetBpm;
+
+                        result.sampleRate =
+                            targetSampleRate;
+
+                        if (musicalSamples <= 0
+                            || sourceRate <= 0.0
+                            || targetBpm <= 0.0
+                            || targetSampleRate <= 0.0)
+                        {
+                            return result;
+                        }
+
+                        const int channels =
+                            sourceSnapshot
+                                .getNumChannels();
+
+                        if (channels <= 0)
+                            return result;
+
+                        const double lengthRatio =
+                            sourceBpm
+                            / targetBpm;
+
+                        const int
+                            stretchedSamplesAtSourceRate =
+                                std::max(
+                                    1,
+                                    static_cast<int>(
+                                        std::llround(
+                                            musicalSamples
+                                            * lengthRatio)));
+
+                        signalsmith::stretch::
+                            SignalsmithStretch<float>
+                                stretch;
+
+                        stretch.presetDefault(
+                            channels,
+                            sourceRate);
+
+                        stretch.setTransposeFactor(
+                            1.0);
+
+                        std::vector<
+                            const float*>
+                            inputPointers(
+                                static_cast<
+                                    size_t>(
+                                    channels));
+
+                        for (int channel = 0;
+                             channel < channels;
+                             ++channel)
+                        {
+                            inputPointers[
+                                static_cast<
+                                    size_t>(
+                                    channel)] =
+                                sourceSnapshot
+                                    .getReadPointer(
+                                        channel);
+                        }
+
+                        juce::AudioBuffer<float>
+                            stretchedAtSourceRate;
+
+                        stretchedAtSourceRate
+                            .setSize(
+                                channels,
+                                stretchedSamplesAtSourceRate);
+
+                        std::vector<float*>
+                            outputPointers(
+                                static_cast<
+                                    size_t>(
+                                    channels));
+
+                        for (int channel = 0;
+                             channel < channels;
+                             ++channel)
+                        {
+                            outputPointers[
+                                static_cast<
+                                    size_t>(
+                                    channel)] =
+                                stretchedAtSourceRate
+                                    .getWritePointer(
+                                        channel);
+                        }
+
+                        stretch.exact(
+                            inputPointers.data(),
+                            musicalSamples,
+                            outputPointers.data(),
+                            stretchedSamplesAtSourceRate);
+
+                        const double
+                            resampleRatio =
+                                sourceRate
+                                / targetSampleRate;
+
+                        const int hostSamples =
+                            std::max(
+                                1,
+                                static_cast<int>(
+                                    std::llround(
+                                        stretchedSamplesAtSourceRate
+                                        * targetSampleRate
+                                        / sourceRate)));
+
+                        result.buffer.setSize(
+                            channels,
+                            hostSamples);
+
+                        for (int channel = 0;
+                             channel < channels;
+                             ++channel)
+                        {
+                            juce::LagrangeInterpolator
+                                interpolator;
+
+                            interpolator.process(
+                                resampleRatio,
+                                stretchedAtSourceRate
+                                    .getReadPointer(
+                                        channel),
+                                result.buffer
+                                    .getWritePointer(
+                                        channel),
+                                hostSamples);
+                        }
+
+                        result.success =
+                            result.buffer
+                                    .getNumSamples()
+                                > 0;
+
+                        return result;
+                    });
+        }
+
+        void finishPreviewBuildIfReady()
+        {
+            if (!previewBuildRunning
+                || !previewBuildFuture.valid())
+            {
+                return;
+            }
+
+            const auto status =
+                previewBuildFuture.wait_for(
+                    std::chrono::milliseconds(
+                        0));
+
+            if (status
+                != std::future_status::ready)
+            {
+                return;
+            }
+
+            HostPreviewBuildResult result =
+                previewBuildFuture.get();
+
+            previewBuildRunning = false;
+
+            if (!result.success)
+            {
+                if (!previewBuildPending)
+                    stretching = false;
+
+                return;
+            }
+
+            const bool stillCurrent =
+                std::abs(
+                    result.bpm
+                    - hostBpm)
+                    <= 0.01
+                && std::abs(
+                       result.sampleRate
+                       - hostSampleRate)
+                    <= 0.5;
+
+            if (stillCurrent)
+            {
+                hostPreviewBuffer =
+                    std::move(
+                        result.buffer);
+
+                stretchedForHostBpm =
+                    result.bpm;
+
+                stretchedForHostSampleRate =
+                    result.sampleRate;
+
+                writeHostPreviewCache();
+            }
+
+            if (previewBuildPending)
+            {
+                stretching = true;
+            }
+            else if (!stillCurrent)
+            {
+                scheduleHostPreviewBuild(
+                    false);
+            }
+            else
+            {
+                stretching = false;
+            }
+
+            repaint();
+        }
+
+        void writeHostPreviewCache()
+        {
+            if (hostPreviewBuffer
+                    .getNumSamples()
+                <= 0
+                || stretchedForHostSampleRate
+                       <= 0.0)
+            {
+                return;
+            }
+
+            const auto cacheDirectory =
+                juce::File::
+                    getSpecialLocation(
+                        juce::File::
+                            tempDirectory)
+                    .getChildFile(
+                        "LoopBridge");
+
+            if (!cacheDirectory.exists())
+            {
+                cacheDirectory
+                    .createDirectory();
+            }
+
+            const auto cacheFile =
+                cacheDirectory
+                    .getChildFile(
+                        "preview.wav");
+
+            cacheFile.deleteFile();
+
+            juce::WavAudioFormat
+                wavFormat;
+
+            std::unique_ptr<
+                juce::FileOutputStream>
+                outputStream(
+                    cacheFile
+                        .createOutputStream());
+
+            if (outputStream == nullptr)
                 return;
 
-            previewQueued = false;
+            std::unique_ptr<
+                juce::AudioFormatWriter>
+                writer(
+                    wavFormat
+                        .createWriterFor(
+                            outputStream.get(),
+                            stretchedForHostSampleRate,
+                            static_cast<
+                                unsigned int>(
+                                hostPreviewBuffer
+                                    .getNumChannels()),
+                            32,
+                            {},
+                            0));
 
-            transportSource.setPosition(0.0);
-            transportSource.start();
+            if (writer == nullptr)
+                return;
 
-            previewPlaying = true;
+            outputStream.release();
+
+            const bool wrote =
+                writer
+                    ->writeFromAudioSampleBuffer(
+                        hostPreviewBuffer,
+                        0,
+                        hostPreviewBuffer
+                            .getNumSamples());
+
+            writer.reset();
+
+            if (!wrote)
+                return;
+
+            sendLoadCommand(
+                cacheFile);
+
+            // Re-send current Bridge state after
+            // publishing a new preview.
+            sendBridgeState();
+
+            hostPreviewReady = true;
+        }
+
+        void sendBridgeState()
+        {
+            const juce::String message =
+                bridgeEnabled
+                    ? "BRIDGE:1"
+                    : "BRIDGE:0";
+
+            sendSocket.write(
+                "127.0.0.1",
+                49153,
+                message.toRawUTF8(),
+                static_cast<int>(
+                    message
+                        .getNumBytesAsUTF8()));
+        }
+
+        void sendLoadCommand(
+            const juce::File& file)
+        {
+            const juce::String message =
+                "LOAD:"
+                + file.getFullPathName();
+
+            sendSocket.write(
+                "127.0.0.1",
+                49153,
+                message.toRawUTF8(),
+                static_cast<int>(
+                    message
+                        .getNumBytesAsUTF8()));
+        }
+
+        void startSoloPreview()
+        {
+            if (soloBuffer
+                    .getNumSamples()
+                <= 0)
+            {
+                return;
+            }
+
+            {
+                const juce::ScopedLock lock(
+                    audioLock);
+
+                soloPlaybackPosition = 0;
+                soloPlaying = true;
+            }
 
             playButton.setEnabled(false);
             stopButton.setEnabled(true);
@@ -529,10 +1274,22 @@ private:
             repaint();
         }
 
-        void cancelQueuedPreview()
+        void stopSoloPreview()
         {
-            previewQueued = false;
-            targetPpq = 0.0;
+            {
+                const juce::ScopedLock lock(
+                    audioLock);
+
+                soloPlaying = false;
+                soloPlaybackPosition = 0;
+            }
+
+            playButton.setEnabled(
+                sourceMusicalSamples > 0);
+
+            stopButton.setEnabled(false);
+
+            repaint();
         }
 
         double getEstimatedPpq() const
@@ -540,194 +1297,278 @@ private:
             if (!haveHostState)
                 return hostPpq;
 
-            if (!hostPlaying || hostBpm <= 0.0)
+            if (!hostPlaying
+                || hostBpm <= 0.0)
+            {
                 return hostPpq;
+            }
 
             const double nowMs =
-                juce::Time::getMillisecondCounterHiRes();
+                juce::Time::
+                    getMillisecondCounterHiRes();
 
             const double elapsedSeconds =
-                (nowMs - hostStateReceivedMs)
+                (nowMs
+                 - hostStateReceivedMs)
                 / 1000.0;
 
-            const double beatsPerSecond =
-                hostBpm / 60.0;
-
             return hostPpq
-                + elapsedSeconds * beatsPerSecond;
+                + elapsedSeconds
+                      * (hostBpm / 60.0);
         }
 
         void processBridgeMessage(
-            const juce::String& message
-        )
+            const juce::String& message)
         {
-            if (!message.startsWith("BPM:"))
+            if (!message.startsWith(
+                    "BPM:"))
+            {
                 return;
+            }
 
-            double newBpm = hostBpm;
-            bool newPlaying = hostPlaying;
-            double newPpq = hostPpq;
+            double newBpm =
+                hostBpm;
+
+            bool newPlaying =
+                hostPlaying;
+
+            double newPpq =
+                hostPpq;
+
+            double newHostSampleRate =
+                hostSampleRate;
 
             juce::StringArray parts;
-            parts.addTokens(message, ";", "");
+
+            parts.addTokens(
+                message,
+                ";",
+                "");
 
             for (const auto& part : parts)
             {
-                if (part.startsWith("BPM:"))
+                if (part.startsWith(
+                        "BPM:"))
                 {
                     newBpm =
                         part
                             .fromFirstOccurrenceOf(
                                 "BPM:",
                                 false,
-                                false
-                            )
+                                false)
                             .getDoubleValue();
                 }
                 else if (
-                    part.startsWith("PLAYING:")
-                )
+                    part.startsWith(
+                        "PLAYING:"))
                 {
                     newPlaying =
                         part
                             .fromFirstOccurrenceOf(
                                 "PLAYING:",
                                 false,
-                                false
-                            )
+                                false)
                             .getIntValue()
                         == 1;
                 }
                 else if (
-                    part.startsWith("PPQ:")
-                )
+                    part.startsWith(
+                        "PPQ:"))
                 {
                     newPpq =
                         part
                             .fromFirstOccurrenceOf(
                                 "PPQ:",
                                 false,
-                                false
-                            )
+                                false)
+                            .getDoubleValue();
+                }
+                else if (
+                    part.startsWith(
+                        "SR:"))
+                {
+                    newHostSampleRate =
+                        part
+                            .fromFirstOccurrenceOf(
+                                "SR:",
+                                false,
+                                false)
                             .getDoubleValue();
                 }
             }
 
-            hostBpm = newBpm;
-            hostPlaying = newPlaying;
-            hostPpq = newPpq;
+            const bool bpmChanged =
+                newBpm > 0.0
+                && std::abs(
+                       newBpm
+                       - hostBpm)
+                    > 0.01;
+
+            const bool sampleRateChanged =
+                newHostSampleRate > 0.0
+                && std::abs(
+                       newHostSampleRate
+                       - hostSampleRate)
+                    > 0.5;
+
+            hostBpm =
+                newBpm;
+
+            hostPlaying =
+                newPlaying;
+
+            hostPpq =
+                newPpq;
+
+            hostSampleRate =
+                newHostSampleRate;
 
             hostStateReceivedMs =
-                juce::Time::getMillisecondCounterHiRes();
+                juce::Time::
+                    getMillisecondCounterHiRes();
 
             haveHostState = true;
+
+            const bool needsInitialPreview =
+                !hostPreviewReady
+                && !previewBuildPending
+                && !previewBuildRunning;
+
+            if (sourceMusicalSamples > 0
+                && (bpmChanged
+                    || sampleRateChanged
+                    || needsInitialPreview))
+            {
+                scheduleHostPreviewBuild(
+                    false);
+            }
         }
 
         void timerCallback() override
         {
-            // Drain all currently available UDP packets.
-            // The newest one becomes our reference point.
             while (true)
             {
                 char buffer[256] {};
 
                 const int bytesRead =
-                    socket.read(
+                    receiveSocket.read(
                         buffer,
                         sizeof(buffer) - 1,
-                        false
-                    );
+                        false);
 
                 if (bytesRead <= 0)
                     break;
 
-                buffer[bytesRead] = '\0';
+                buffer[bytesRead] =
+                    '\0';
 
                 processBridgeMessage(
-                    juce::String(buffer)
-                );
+                    juce::String::fromUTF8(
+                        buffer,
+                        bytesRead));
             }
 
-            // If a preview is queued, use our locally
-            // extrapolated PPQ to decide when to start.
-            if (previewQueued)
+            finishPreviewBuildIfReady();
+
+            if (previewBuildPending
+                && !previewBuildRunning)
             {
-                if (!hostPlaying)
+                const double nowMs =
+                    juce::Time::
+                        getMillisecondCounterHiRes();
+
+                if (nowMs
+                        - previewBuildRequestedMs
+                    >= previewDebounceMs)
                 {
-                    // FL stopped before the target beat.
-                    cancelQueuedPreview();
-
-                    playButton.setEnabled(
-                        readerSource != nullptr
-                    );
-
-                    stopButton.setEnabled(false);
+                    startPendingPreviewBuild();
                 }
-                else
-                {
-                    const double currentPpq =
-                        getEstimatedPpq();
-
-                    if (currentPpq >= targetPpq)
-                    {
-                        startPreviewNow();
-                    }
-                }
-            }
-
-            // Detect natural end of the audio file.
-            if (previewPlaying
-                && !transportSource.isPlaying())
-            {
-                previewPlaying = false;
-
-                playButton.setEnabled(
-                    readerSource != nullptr
-                );
-
-                stopButton.setEnabled(false);
             }
 
             repaint();
         }
 
-        juce::DatagramSocket socket;
+        juce::DatagramSocket
+            receiveSocket;
+
+        juce::DatagramSocket
+            sendSocket;
 
         bool listening = false;
+
+        bool bridgeEnabled = true;
 
         double hostBpm = 0.0;
         bool hostPlaying = false;
         double hostPpq = 0.0;
 
+        double hostSampleRate = 0.0;
+        double sourceSampleRate = 0.0;
+        double deviceSampleRate = 0.0;
+
         bool haveHostState = false;
 
-        double hostStateReceivedMs = 0.0;
+        double hostStateReceivedMs =
+            0.0;
 
-        bool previewQueued = false;
-        bool previewPlaying = false;
+        bool stretching = false;
+        bool hostPreviewReady = false;
+        bool soloPlaying = false;
 
-        double targetPpq = 0.0;
+        double stretchedForHostBpm =
+            0.0;
 
-        juce::AudioFormatManager formatManager;
-        juce::AudioTransportSource transportSource;
+        double stretchedForHostSampleRate =
+            0.0;
+
+        bool previewBuildPending = false;
+        bool previewBuildRunning = false;
+
+        double previewBuildRequestedMs =
+            0.0;
+
+        double pendingPreviewBpm =
+            0.0;
+
+        double pendingPreviewSampleRate =
+            0.0;
+
+        std::future<
+            HostPreviewBuildResult>
+            previewBuildFuture;
+
+        int sourceMusicalSamples = 0;
+        int soloPlaybackPosition = 0;
+
+        juce::AudioFormatManager
+            formatManager;
+
+        juce::AudioBuffer<float>
+            sourceBuffer;
+
+        juce::AudioBuffer<float>
+            soloBuffer;
+
+        juce::AudioBuffer<float>
+            hostPreviewBuffer;
+
+        juce::CriticalSection
+            audioLock;
 
         std::unique_ptr<
-            juce::AudioFormatReaderSource
-        > readerSource;
-
-        std::unique_ptr<juce::FileChooser>
+            juce::FileChooser>
             fileChooser;
 
         juce::TextButton loadButton;
         juce::TextButton playButton;
         juce::TextButton stopButton;
+        juce::TextButton bridgeButton;
 
         juce::String loadedFileName;
     };
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(
-        LoopBridgeWindow
-    )
+        LoopBridgeWindow)
 };
 
 class LoopBridgeApplication
@@ -747,11 +1588,11 @@ public:
     }
 
     void initialise(
-        const juce::String&
-    ) override
+        const juce::String&) override
     {
         mainWindow =
-            std::make_unique<LoopBridgeWindow>();
+            std::make_unique<
+                LoopBridgeWindow>();
     }
 
     void shutdown() override
@@ -760,10 +1601,10 @@ public:
     }
 
 private:
-    std::unique_ptr<LoopBridgeWindow>
+    std::unique_ptr<
+        LoopBridgeWindow>
         mainWindow;
 };
 
 START_JUCE_APPLICATION(
-    LoopBridgeApplication
-)
+    LoopBridgeApplication)

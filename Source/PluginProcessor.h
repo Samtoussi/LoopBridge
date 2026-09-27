@@ -1,7 +1,9 @@
 #pragma once
 
 #include <JuceHeader.h>
+
 #include <atomic>
+#include <memory>
 
 class LoopBridgeAudioProcessor
     : public juce::AudioProcessor,
@@ -11,17 +13,24 @@ public:
     LoopBridgeAudioProcessor();
     ~LoopBridgeAudioProcessor() override;
 
-    void prepareToPlay(double sampleRate, int samplesPerBlock) override;
+    void prepareToPlay(
+        double sampleRate,
+        int samplesPerBlock) override;
+
     void releaseResources() override;
 
-    bool isBusesLayoutSupported(const BusesLayout& layouts) const override;
+#ifndef JucePlugin_PreferredChannelConfigurations
+    bool isBusesLayoutSupported(
+        const BusesLayout& layouts) const override;
+#endif
 
     void processBlock(
         juce::AudioBuffer<float>&,
-        juce::MidiBuffer&
-    ) override;
+        juce::MidiBuffer&) override;
 
-    juce::AudioProcessorEditor* createEditor() override;
+    juce::AudioProcessorEditor*
+    createEditor() override;
+
     bool hasEditor() const override;
 
     const juce::String getName() const override;
@@ -34,31 +43,68 @@ public:
 
     int getNumPrograms() override;
     int getCurrentProgram() override;
+
     void setCurrentProgram(int index) override;
-    const juce::String getProgramName(int index) override;
+
+    const juce::String
+    getProgramName(int index) override;
+
     void changeProgramName(
         int index,
-        const juce::String& newName
-    ) override;
+        const juce::String& newName) override;
 
-    void getStateInformation(juce::MemoryBlock& destData) override;
+    void getStateInformation(
+        juce::MemoryBlock& destData) override;
+
     void setStateInformation(
         const void* data,
-        int sizeInBytes
-    ) override;
+        int sizeInBytes) override;
 
-    double getHostBpm() const;
+    double getHostBpm() const
+    {
+        return hostBpm.load();
+    }
 
 private:
+    struct PreviewData
+    {
+        juce::AudioBuffer<float> buffer;
+        double sampleRate = 0.0;
+    };
+
     void timerCallback() override;
 
-    std::atomic<double> hostBpm { 0.0 };
-    std::atomic<bool> hostPlaying { false };
-    std::atomic<double> hostPpq { 0.0 };
+    void handleDesktopMessage(
+        const juce::String& message);
 
-    juce::DatagramSocket bridgeSocket { false };
+    void loadPreviewFile(
+        const juce::File& file);
+
+    void sendHostState(
+        double bpm,
+        bool playing,
+        double ppq);
+
+    juce::DatagramSocket sendSocket;
+    juce::DatagramSocket receiveSocket;
+
+    juce::AudioFormatManager
+        formatManager;
+
+    std::shared_ptr<PreviewData>
+        previewData;
+
+    std::atomic<double>
+        hostBpm { 0.0 };
+
+    // Desktop Bridge ON/OFF state.
+    // Starts enabled so existing behaviour is preserved.
+    std::atomic<bool>
+        bridgeEnabled { true };
+
+    double currentSampleRate = 0.0;
+    double lastSendTimeMs = 0.0;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(
-        LoopBridgeAudioProcessor
-    )
+        LoopBridgeAudioProcessor)
 };
