@@ -521,6 +521,15 @@ private:
                 return true;
             }
 
+            if (key
+                    == juce::KeyPress::returnKey
+                || key
+                    == juce::KeyPress::numberPadEnter)
+            {
+                loadSelectedGmailLoop();
+                return true;
+            }
+
             return false;
         }
 
@@ -563,6 +572,49 @@ private:
                 selectLoop(
                     itemIndex);
             }
+
+            grabKeyboardFocus();
+        }
+
+        void mouseDoubleClick(
+            const juce::MouseEvent& event) override
+        {
+            if (loopItems.empty())
+                return;
+
+            const int rowsTop =
+                browserTop
+                + browserHeaderHeight;
+
+            if (event.y < rowsTop
+                || event.y
+                       >= rowsTop
+                              + browserVisibleRows
+                                    * browserRowHeight)
+            {
+                return;
+            }
+
+            const int visibleRow =
+                (event.y - rowsTop)
+                / browserRowHeight;
+
+            const int itemIndex =
+                browserScrollIndex
+                + visibleRow;
+
+            if (itemIndex < 0
+                || itemIndex
+                       >= static_cast<int>(
+                           loopItems.size()))
+            {
+                return;
+            }
+
+            selectLoop(
+                itemIndex);
+
+            loadSelectedGmailLoop();
 
             grabKeyboardFocus();
         }
@@ -1117,6 +1169,74 @@ private:
             }
 
             return "--";
+        }
+
+        void loadSelectedGmailLoop()
+        {
+            if (selectedLoopIndex < 0
+                || selectedLoopIndex
+                       >= static_cast<int>(
+                           loopItems.size()))
+            {
+                return;
+            }
+
+            const auto item =
+                loopItems[
+                    static_cast<size_t>(
+                        selectedLoopIndex)];
+
+            gmailStatus =
+                "GMAIL: DOWNLOADING "
+                + item.filename;
+
+            repaint();
+
+            gmailClient.downloadAudioAttachment(
+                item.messageId,
+                item.attachmentId,
+                item.filename,
+                [this, item](
+                    const juce::File& file,
+                    const juce::String& error)
+                {
+                    if (error.isNotEmpty())
+                    {
+                        gmailStatus =
+                            "GMAIL ERROR: "
+                            + error;
+
+                        juce::Logger::writeToLog(
+                            "GMAIL DOWNLOAD ERROR: "
+                            + error);
+
+                        repaint();
+                        return;
+                    }
+
+                    if (!file.existsAsFile())
+                    {
+                        gmailStatus =
+                            "GMAIL ERROR: DOWNLOADED FILE NOT FOUND";
+
+                        repaint();
+                        return;
+                    }
+
+                    gmailStatus =
+                        "GMAIL: LOADED "
+                        + item.filename;
+
+                    juce::Logger::writeToLog(
+                        "GMAIL LOOP DOWNLOADED: "
+                        + file.getFullPathName());
+
+                    loadAudioFile(
+                        file);
+
+                    grabKeyboardFocus();
+                    repaint();
+                });
         }
 
         void selectLoop(

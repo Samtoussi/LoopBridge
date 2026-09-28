@@ -38,6 +38,11 @@ public:
             const std::vector<AudioAttachment>&,
             const juce::String&)>;
 
+    using DownloadCallback =
+        std::function<void(
+            const juce::File&,
+            const juce::String&)>;
+
     GmailClient();
     ~GmailClient();
 
@@ -53,6 +58,13 @@ public:
     void fetchRecentAudioAttachments(
         int maxMessages,
         AudioListCallback callback);
+
+    void downloadAudioAttachment(
+        const juce::String& messageId,
+        const juce::String& attachmentId,
+        const juce::String& filename,
+        const juce::File& destinationDirectory,
+        DownloadCallback callback) const;
 
 private:
     friend class GmailAuthThread;

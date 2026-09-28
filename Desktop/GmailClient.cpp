@@ -96,6 +96,66 @@ namespace
             true);
     }
 
+    juce::String sanitiseFilename(
+        const juce::String& filename)
+    {
+        juce::String result =
+            filename.trim();
+
+        if (result.isEmpty())
+        {
+            result =
+                "loopbridge-audio";
+        }
+
+        const juce::String invalidCharacters =
+            "\\/:*?\"<>|";
+
+        for (auto character
+             : invalidCharacters)
+        {
+            result =
+                result.replaceCharacter(
+                    character,
+                    '_');
+        }
+
+        return result;
+    }
+
+    bool decodeBase64Url(
+        juce::String encoded,
+        juce::MemoryBlock& output)
+    {
+        encoded =
+            encoded.trim();
+
+        if (encoded.isEmpty())
+        {
+            return false;
+        }
+
+        encoded =
+            encoded.replaceCharacter(
+                '-',
+                '+');
+
+        encoded =
+            encoded.replaceCharacter(
+                '_',
+                '/');
+
+        while ((encoded.length() % 4) != 0)
+        {
+            encoded += "=";
+        }
+
+        output.reset();
+
+        return output.fromBase64Encoding(
+            encoded);
+    }
+
 #if JUCE_WINDOWS
 
     class SocketGuard
@@ -985,40 +1045,51 @@ bool GmailClient::performAuthorizedGet(
     {
         errorMessage =
             "No Gmail access token is available.";
+
         return false;
     }
 
     const auto options =
         juce::URL::InputStreamOptions(
-            juce::URL::ParameterHandling::inAddress)
-            .withHttpRequestCmd("GET")
+            juce::URL::
+                ParameterHandling::
+                    inAddress)
+            .withHttpRequestCmd(
+                "GET")
             .withExtraHeaders(
                 "Authorization: Bearer "
                 + accessToken
                 + "\r\n")
-            .withConnectionTimeoutMs(15000);
+            .withConnectionTimeoutMs(
+                15000);
 
     auto stream =
-        juce::URL(requestUrl)
-            .createInputStream(options);
+        juce::URL(
+            requestUrl)
+            .createInputStream(
+                options);
 
     if (stream == nullptr)
     {
         errorMessage =
             "Could not connect to Gmail API.";
+
         return false;
     }
 
     const auto response =
-        stream->readEntireStreamAsString();
+        stream
+            ->readEntireStreamAsString();
 
     jsonResult =
-        juce::JSON::parse(response);
+        juce::JSON::parse(
+            response);
 
     if (!jsonResult.isObject())
     {
         errorMessage =
             "Gmail API returned invalid JSON.";
+
         return false;
     }
 
@@ -1026,7 +1097,8 @@ bool GmailClient::performAuthorizedGet(
             jsonResult.getDynamicObject())
     {
         const auto apiError =
-            object->getProperty("error");
+            object->getProperty(
+                "error");
 
         if (!apiError.isVoid()
             && !apiError.isUndefined())
@@ -1036,6 +1108,7 @@ bool GmailClient::performAuthorizedGet(
                 + juce::JSON::toString(
                     apiError,
                     true);
+
             return false;
         }
     }
@@ -1043,12 +1116,15 @@ bool GmailClient::performAuthorizedGet(
     return true;
 }
 
-juce::String GmailClient::getHeaderValue(
+juce::String
+GmailClient::getHeaderValue(
     const juce::var& headers,
     const juce::String& name)
 {
     if (!headers.isArray())
+    {
         return {};
+    }
 
     for (const auto& header
          : *headers.getArray())
@@ -1057,16 +1133,23 @@ juce::String GmailClient::getHeaderValue(
             header.getDynamicObject();
 
         if (object == nullptr)
+        {
             continue;
+        }
 
         const auto headerName =
-            object->getProperty("name")
+            object
+                ->getProperty(
+                    "name")
                 .toString();
 
-        if (headerName.equalsIgnoreCase(name))
+        if (headerName
+                .equalsIgnoreCase(
+                    name))
         {
             return object
-                ->getProperty("value")
+                ->getProperty(
+                    "value")
                 .toString();
         }
     }
@@ -1085,33 +1168,50 @@ void GmailClient::collectAudioAttachments(
         part.getDynamicObject();
 
     if (object == nullptr)
+    {
         return;
+    }
 
     const auto filename =
-        object->getProperty("filename")
+        object
+            ->getProperty(
+                "filename")
             .toString();
 
     const auto mimeType =
-        object->getProperty("mimeType")
+        object
+            ->getProperty(
+                "mimeType")
             .toString();
 
     const auto lowerFilename =
         filename.toLowerCase();
 
     const bool audioExtension =
-        lowerFilename.endsWith(".wav")
-        || lowerFilename.endsWith(".mp3")
-        || lowerFilename.endsWith(".aif")
-        || lowerFilename.endsWith(".aiff")
-        || lowerFilename.endsWith(".flac")
-        || lowerFilename.endsWith(".m4a")
-        || lowerFilename.endsWith(".ogg");
+        lowerFilename.endsWith(
+            ".wav")
+        || lowerFilename.endsWith(
+            ".mp3")
+        || lowerFilename.endsWith(
+            ".aif")
+        || lowerFilename.endsWith(
+            ".aiff")
+        || lowerFilename.endsWith(
+            ".flac")
+        || lowerFilename.endsWith(
+            ".m4a")
+        || lowerFilename.endsWith(
+            ".ogg");
 
     const bool audioMime =
-        mimeType.startsWithIgnoreCase("audio/");
+        mimeType
+            .startsWithIgnoreCase(
+                "audio/");
 
     const auto body =
-        object->getProperty("body");
+        object
+            ->getProperty(
+                "body");
 
     juce::String attachmentId;
 
@@ -1120,30 +1220,46 @@ void GmailClient::collectAudioAttachments(
     {
         attachmentId =
             bodyObject
-                ->getProperty("attachmentId")
+                ->getProperty(
+                    "attachmentId")
                 .toString();
     }
 
     if (filename.isNotEmpty()
         && attachmentId.isNotEmpty()
-        && (audioExtension || audioMime))
+        && (audioExtension
+            || audioMime))
     {
         AudioAttachment item;
-        item.messageId = messageId;
-        item.attachmentId = attachmentId;
-        item.filename = filename;
-        item.sender = sender;
-        item.subject = subject;
+
+        item.messageId =
+            messageId;
+
+        item.attachmentId =
+            attachmentId;
+
+        item.filename =
+            filename;
+
+        item.sender =
+            sender;
+
+        item.subject =
+            subject;
 
         output.push_back(
             std::move(item));
     }
 
     const auto parts =
-        object->getProperty("parts");
+        object
+            ->getProperty(
+                "parts");
 
     if (!parts.isArray())
+    {
         return;
+    }
 
     for (const auto& child
          : *parts.getArray())
@@ -1157,19 +1273,24 @@ void GmailClient::collectAudioAttachments(
     }
 }
 
-void GmailClient::fetchRecentAudioAttachments(
-    int maxMessages,
-    AudioListCallback callback)
+void GmailClient::
+    fetchRecentAudioAttachments(
+        int maxMessages,
+        AudioListCallback callback)
 {
     if (!callback)
+    {
         return;
+    }
 
-    if (state != State::connected
+    if (state
+            != State::connected
         || accessToken.isEmpty())
     {
         callback(
             {},
             "Gmail is not connected.");
+
         return;
     }
 
@@ -1180,11 +1301,14 @@ void GmailClient::fetchRecentAudioAttachments(
             maxMessages);
 
     const auto listUrl =
-        juce::String(gmailApiBase)
+        juce::String(
+            gmailApiBase)
         + "/messages?maxResults="
-        + juce::String(maxMessages)
+        + juce::String(
+            maxMessages)
         + "&q="
-        + urlEncode("has:attachment");
+        + urlEncode(
+            "has:attachment");
 
     juce::var listJson;
     juce::String error;
@@ -1194,85 +1318,115 @@ void GmailClient::fetchRecentAudioAttachments(
             listJson,
             error))
     {
-        callback({}, error);
+        callback(
+            {},
+            error);
+
         return;
     }
 
     auto* listObject =
-        listJson.getDynamicObject();
+        listJson
+            .getDynamicObject();
 
     if (listObject == nullptr)
     {
         callback(
             {},
             "Gmail message list was empty.");
+
         return;
     }
 
     const auto messages =
-        listObject->getProperty("messages");
+        listObject
+            ->getProperty(
+                "messages");
 
     if (!messages.isArray())
     {
-        callback({}, {});
+        callback(
+            {},
+            {});
+
         return;
     }
 
-    std::vector<AudioAttachment> results;
+    std::vector<AudioAttachment>
+        results;
 
     for (const auto& message
          : *messages.getArray())
     {
         auto* messageRef =
-            message.getDynamicObject();
+            message
+                .getDynamicObject();
 
         if (messageRef == nullptr)
-            continue;
-
-        const auto messageId =
-            messageRef
-                ->getProperty("id")
-                .toString();
-
-        if (messageId.isEmpty())
-            continue;
-
-        const auto messageUrl =
-            juce::String(gmailApiBase)
-            + "/messages/"
-            + messageId
-            + "?format=full";
-
-        juce::var messageJson;
-        juce::String messageError;
-
-        if (!performAuthorizedGet(
-                messageUrl,
-                messageJson,
-                messageError))
         {
             continue;
         }
 
+        const auto messageId =
+            messageRef
+                ->getProperty(
+                    "id")
+                .toString();
+
+        if (messageId.isEmpty())
+        {
+            continue;
+        }
+
+        const auto messageUrl =
+            juce::String(
+                gmailApiBase)
+            + "/messages/"
+            + urlEncode(
+                messageId)
+            + "?format=full";
+
+        juce::var messageJson;
+
+        if (!performAuthorizedGet(
+                messageUrl,
+                messageJson,
+                error))
+        {
+            callback(
+                {},
+                error);
+
+            return;
+        }
+
         auto* messageObject =
-            messageJson.getDynamicObject();
+            messageJson
+                .getDynamicObject();
 
         if (messageObject == nullptr)
+        {
             continue;
+        }
 
         const auto payload =
             messageObject
-                ->getProperty("payload");
+                ->getProperty(
+                    "payload");
 
         auto* payloadObject =
-            payload.getDynamicObject();
+            payload
+                .getDynamicObject();
 
         if (payloadObject == nullptr)
+        {
             continue;
+        }
 
         const auto headers =
             payloadObject
-                ->getProperty("headers");
+                ->getProperty(
+                    "headers");
 
         const auto sender =
             getHeaderValue(
@@ -1294,6 +1448,212 @@ void GmailClient::fetchRecentAudioAttachments(
 
     callback(
         results,
+        {});
+}
+
+void GmailClient::
+    downloadAudioAttachment(
+        const juce::String& messageId,
+        const juce::String& attachmentId,
+        const juce::String& filename,
+        const juce::File& destinationDirectory,
+        DownloadCallback callback) const
+{
+    if (!callback)
+    {
+        return;
+    }
+
+    if (state
+            != State::connected
+        || accessToken.isEmpty())
+    {
+        callback(
+            {},
+            "Gmail is not connected.");
+
+        return;
+    }
+
+    if (messageId.isEmpty()
+        || attachmentId.isEmpty())
+    {
+        callback(
+            {},
+            "The selected Gmail attachment "
+            "does not have a valid ID.");
+
+        return;
+    }
+
+    auto directory =
+        destinationDirectory;
+
+    if (!directory.exists())
+    {
+        const auto result =
+            directory.createDirectory();
+
+        if (result.failed())
+        {
+            callback(
+                {},
+                "Could not create the "
+                "LoopBridge cache directory: "
+                + result.getErrorMessage());
+
+            return;
+        }
+    }
+
+    if (!directory.isDirectory())
+    {
+        callback(
+            {},
+            "The LoopBridge cache path "
+            "is not a directory.");
+
+        return;
+    }
+
+    const auto requestUrl =
+        juce::String(
+            gmailApiBase)
+        + "/messages/"
+        + urlEncode(
+            messageId)
+        + "/attachments/"
+        + urlEncode(
+            attachmentId);
+
+    juce::var json;
+    juce::String error;
+
+    if (!performAuthorizedGet(
+            requestUrl,
+            json,
+            error))
+    {
+        callback(
+            {},
+            error);
+
+        return;
+    }
+
+    auto* object =
+        json.getDynamicObject();
+
+    if (object == nullptr)
+    {
+        callback(
+            {},
+            "Gmail returned an invalid "
+            "attachment response.");
+
+        return;
+    }
+
+    const auto encodedData =
+        object
+            ->getProperty(
+                "data")
+            .toString();
+
+    if (encodedData.isEmpty())
+    {
+        callback(
+            {},
+            "Gmail returned an empty "
+            "audio attachment.");
+
+        return;
+    }
+
+    juce::MemoryBlock decodedData;
+
+    if (!decodeBase64Url(
+            encodedData,
+            decodedData))
+    {
+        callback(
+            {},
+            "Could not decode the Gmail "
+            "audio attachment.");
+
+        return;
+    }
+
+    if (decodedData.getSize() == 0)
+    {
+        callback(
+            {},
+            "The decoded Gmail attachment "
+            "was empty.");
+
+        return;
+    }
+
+    const auto safeFilename =
+        sanitiseFilename(
+            filename);
+
+    const auto messagePrefix =
+        messageId.substring(
+            0,
+            juce::jmin(
+                12,
+                messageId.length()));
+
+    auto outputFile =
+        directory.getChildFile(
+            messagePrefix
+            + "_"
+            + safeFilename);
+
+    outputFile.deleteFile();
+
+    std::unique_ptr<
+        juce::FileOutputStream>
+        outputStream(
+            outputFile
+                .createOutputStream());
+
+    if (outputStream == nullptr)
+    {
+        callback(
+            {},
+            "Could not create the cached "
+            "audio file.");
+
+        return;
+    }
+
+    const bool writeSucceeded =
+        outputStream->write(
+            decodedData.getData(),
+            decodedData.getSize());
+
+    outputStream->flush();
+
+    outputStream.reset();
+
+    if (!writeSucceeded
+        || !outputFile.existsAsFile()
+        || outputFile.getSize() <= 0)
+    {
+        outputFile.deleteFile();
+
+        callback(
+            {},
+            "Could not write the Gmail "
+            "audio attachment to disk.");
+
+        return;
+    }
+
+    callback(
+        outputFile,
         {});
 }
 
@@ -1320,10 +1680,12 @@ GmailClient::base64UrlEncode(
     const void* data,
     size_t size)
 {
+    juce::MemoryBlock block(
+        data,
+        size);
+
     auto encoded =
-        juce::Base64::toBase64(
-            data,
-            size);
+        block.toBase64Encoding();
 
     encoded =
         encoded.replaceCharacter(
@@ -1335,12 +1697,12 @@ GmailClient::base64UrlEncode(
             '/',
             '_');
 
-    while (
-        encoded.endsWithChar('='))
+    while (encoded.endsWithChar(
+        '='))
     {
         encoded =
-            encoded
-                .dropLastCharacters(1);
+            encoded.dropLastCharacters(
+                1);
     }
 
     return encoded;
