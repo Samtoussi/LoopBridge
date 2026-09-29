@@ -527,6 +527,8 @@ private:
         void mouseDown(
             const juce::MouseEvent& event) override
         {
+            dragCandidateIndex = -1;
+
             if (loopItems.empty())
             {
                 grabKeyboardFocus();
@@ -562,6 +564,18 @@ private:
             {
                 selectLoop(itemIndex);
 
+                const int downloadLeft =
+                    browserLeft + getWidth()
+                    - browserLeft * 2 - 42;
+
+                if (event.x >= downloadLeft
+                    && event.x < downloadLeft + 30)
+                {
+                    downloadSelectedLoop();
+                    grabKeyboardFocus();
+                    return;
+                }
+
                 const int playButtonLeft =
                     browserLeft + 10;
 
@@ -573,9 +587,48 @@ private:
                 {
                     toggleSelectedLoopPreview();
                 }
+                else if (event.mods.isLeftButtonDown()
+                         && getDownloadedLoopFile(
+                             loopItems[static_cast<size_t>(itemIndex)])
+                             .existsAsFile())
+                {
+                    dragCandidateIndex = itemIndex;
+                }
             }
 
             grabKeyboardFocus();
+        }
+
+        void mouseDrag(
+            const juce::MouseEvent& event) override
+        {
+            if (dragCandidateIndex < 0
+                || event.getDistanceFromDragStart() < 5)
+                return;
+
+            const int index = dragCandidateIndex;
+            dragCandidateIndex = -1;
+
+            if (index >= static_cast<int>(loopItems.size()))
+                return;
+
+            const auto file = getDownloadedLoopFile(
+                loopItems[static_cast<size_t>(index)]);
+
+            if (!file.existsAsFile())
+                return;
+
+            juce::StringArray files;
+            files.add(file.getFullPathName());
+
+            juce::DragAndDropContainer::performExternalDragDropOfFiles(
+                files, false, this);
+        }
+
+        void mouseUp(
+            const juce::MouseEvent&) override
+        {
+            dragCandidateIndex = -1;
         }
 
         void mouseWheelMove(
@@ -665,6 +718,14 @@ private:
             {
                 return;
             }
+
+            const int downloadLeft =
+                browserLeft + getWidth()
+                - browserLeft * 2 - 42;
+
+            if (event.x >= downloadLeft
+                && event.x < downloadLeft + 30)
+                return;
 
             selectLoop(
                 itemIndex);
@@ -1262,6 +1323,111 @@ private:
             return directory;
         }
 
+        juce::File getDownloadedLoopDirectory(
+            const LoopItem& item) const
+        {
+            return juce::File::getSpecialLocation(
+                       juce::File::userDocumentsDirectory)
+                .getChildFile("LoopBridge")
+                .getChildFile("Downloads")
+                .getChildFile(juce::String::toHexString(
+                    getLoopCacheKey(item).hashCode64()));
+        }
+
+        juce::File getDownloadedLoopFile(
+            const LoopItem& item) const
+        {
+            const auto directory =
+                getDownloadedLoopDirectory(item);
+
+            juce::Array<juce::File> files;
+            directory.findChildFiles(
+                files, juce::File::findFiles, false);
+
+            return files.isEmpty()
+                ? juce::File{}
+                : files.getFirst();
+        }
+
+        void downloadSelectedLoop()
+        {
+            if (selectedLoopIndex < 0
+                || selectedLoopIndex >= static_cast<int>(loopItems.size()))
+                return;
+
+            const auto item =
+                loopItems[static_cast<size_t>(selectedLoopIndex)];
+            const auto key = getLoopCacheKey(item);
+
+            if (getDownloadedLoopFile(item).existsAsFile()
+                || downloadsInFlight.count(key) > 0)
+                return;
+
+            const auto directory = getDownloadedLoopDirectory(item);
+            if (!directory.createDirectory())
+            {
+                gmailStatus = "DOWNLOAD ERROR: COULD NOT CREATE FOLDER";
+                repaint();
+                return;
+            }
+
+            downloadsInFlight.insert(key);
+            repaint();
+
+            const auto finish = [this, item, key](
+                const juce::File& file, const juce::String& error)
+            {
+                downloadsInFlight.erase(key);
+
+                if (error.isEmpty() && file.existsAsFile())
+                    gmailStatus = "DOWNLOADED: " + item.filename;
+                else
+                    gmailStatus = "DOWNLOAD ERROR: "
+                        + (error.isNotEmpty() ? error : "FILE NOT FOUND");
+
+                repaint();
+            };
+
+            const auto cached = gmailLoopCache.find(key);
+            if (cached != gmailLoopCache.end()
+                && cached->second.existsAsFile())
+            {
+                const auto target = directory.getChildFile(
+                    cached->second.getFileName());
+                const bool copied = cached->second.copyFileTo(target);
+                finish(copied ? target : juce::File{},
+                       copied ? juce::String{}
+                              : juce::String("COULD NOT SAVE FILE"));
+                return;
+            }
+
+            gmailClient.downloadAudioAttachment(
+                item.messageId,
+                item.attachmentId,
+                item.filename,
+                getLoopCacheDirectory(),
+                [this, key, directory, finish](
+                    const juce::File& file,
+                    const juce::String& error)
+                {
+                    if (error.isNotEmpty() || !file.existsAsFile())
+                    {
+                        finish(file, error);
+                        return;
+                    }
+
+                    gmailLoopCache[key] = file;
+                    rememberLoopDuration(key, file);
+
+                    const auto target = directory.getChildFile(
+                        file.getFileName());
+                    const bool copied = file.copyFileTo(target);
+                    finish(copied ? target : juce::File{},
+                           copied ? juce::String{}
+                                  : juce::String("COULD NOT SAVE FILE"));
+                });
+        }
+
         double getAudioDurationSeconds(
             const juce::File& file)
         {
@@ -1673,22 +1839,25 @@ private:
             const int senderX =
                 browserLeft
                 + browserWidth
-                - 410;
+                - 460;
 
             const int bpmX =
                 browserLeft
                 + browserWidth
-                - 250;
+                - 300;
 
             const int keyX =
                 browserLeft
                 + browserWidth
-                - 170;
+                - 220;
 
             const int durationX =
                 browserLeft
                 + browserWidth
-                - 82;
+                - 132;
+
+            const int downloadX =
+                browserLeft + browserWidth - 42;
 
             g.drawText(
                 "LOOP",
@@ -1983,6 +2152,26 @@ private:
                     76,
                     browserRowHeight,
                     juce::Justification::centredLeft);
+
+                const bool downloaded =
+                    getDownloadedLoopFile(item).existsAsFile();
+                const bool downloading =
+                    downloadsInFlight.count(getLoopCacheKey(item)) > 0;
+
+                g.setColour(
+                    downloaded ? juce::Colours::lightgreen
+                    : downloading ? juce::Colours::orange
+                                  : juce::Colours::cornflowerblue);
+                g.setFont(juce::Font(juce::FontOptions(
+                    18.0f, juce::Font::bold)));
+                g.drawText(
+                    downloaded ? juce::String::fromUTF8("\xE2\x9C\x93")
+                    : downloading ? "..." : "+",
+                    downloadX,
+                    rowY,
+                    30,
+                    browserRowHeight,
+                    juce::Justification::centred);
 
                 g.setColour(
                     juce::Colours::white
@@ -3188,11 +3377,17 @@ private:
         int browserScrollIndex =
             0;
 
+        int dragCandidateIndex =
+            -1;
+
         std::map<juce::String, juce::File>
             gmailLoopCache;
 
         std::set<juce::String>
             gmailPrefetchInFlight;
+
+        std::set<juce::String>
+            downloadsInFlight;
 
         std::map<juce::String, double>
             gmailLoopDurations;
