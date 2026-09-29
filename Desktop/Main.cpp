@@ -752,7 +752,11 @@ private:
                 1);
 
             juce::String sourceText =
-                "SOURCE: 100 BPM / 4 BARS";
+                sourceBpm > 0.0
+                    ? "SOURCE: "
+                          + juce::String(sourceBpm, 0)
+                          + " BPM / 4 BARS"
+                    : "SOURCE: BPM UNKNOWN / 4 BARS";
 
             if (hostBpm > 0.0)
             {
@@ -850,7 +854,11 @@ private:
                     juce::Colours::lightgreen);
 
                 g.drawFittedText(
-                    "SOLO PREVIEW / ORIGINAL 100 BPM",
+                    sourceBpm > 0.0
+                        ? "SOLO PREVIEW / ORIGINAL "
+                              + juce::String(sourceBpm, 0)
+                              + " BPM"
+                        : "SOLO PREVIEW / BPM UNKNOWN",
                     0,
                     287,
                     getWidth(),
@@ -908,21 +916,32 @@ private:
                     sourceBuffer.getNumSamples()
                     / sourceSampleRate;
 
-                const double musicalSeconds =
-                    loopBeats
-                    * 60.0
-                    / sourceBpm;
-
                 juce::String lengthText =
                     "File: "
                     + juce::String(
                         fileSeconds,
                         3)
-                    + "s / Musical: "
-                    + juce::String(
-                        musicalSeconds,
-                        3)
                     + "s";
+
+                if (sourceBpm > 0.0)
+                {
+                    const double musicalSeconds =
+                        loopBeats
+                        * 60.0
+                        / sourceBpm;
+
+                    lengthText +=
+                        " / Musical: "
+                        + juce::String(
+                            musicalSeconds,
+                            3)
+                        + "s";
+                }
+                else
+                {
+                    lengthText +=
+                        " / Musical: BPM unknown";
+                }
 
                 if (hostPreviewBuffer
                             .getNumSamples()
@@ -1043,9 +1062,6 @@ private:
         }
 
     private:
-        static constexpr double sourceBpm =
-            100.0;
-
         static constexpr double loopBeats =
             16.0;
 
@@ -1237,7 +1253,10 @@ private:
                         + file.getFullPathName());
 
                     loadAudioFile(
-                        file);
+                        file,
+                        item.bpm.has_value()
+                            ? *item.bpm
+                            : 0.0);
 
                     grabKeyboardFocus();
                     repaint();
@@ -1725,12 +1744,14 @@ private:
                         return;
 
                     loadAudioFile(
-                        file);
+                        file,
+                        100.0);
                 });
         }
 
         void loadAudioFile(
-            const juce::File& file)
+            const juce::File& file,
+            double bpm)
         {
             std::unique_ptr<
                 juce::AudioFormatReader>
@@ -1743,6 +1764,8 @@ private:
                 return;
 
             stopSoloPreview();
+
+            sourceBpm = bpm;
 
             sourceSampleRate =
                 reader->sampleRate;
@@ -1778,20 +1801,28 @@ private:
                 true,
                 true);
 
-            const double
-                musicalDurationSeconds =
-                    loopBeats
-                    * 60.0
-                    / sourceBpm;
+            if (sourceBpm > 0.0)
+            {
+                const double
+                    musicalDurationSeconds =
+                        loopBeats
+                        * 60.0
+                        / sourceBpm;
 
-            sourceMusicalSamples =
-                std::min(
-                    sourceBuffer
-                        .getNumSamples(),
-                    static_cast<int>(
-                        std::llround(
-                            musicalDurationSeconds
-                            * sourceSampleRate)));
+                sourceMusicalSamples =
+                    std::min(
+                        sourceBuffer
+                            .getNumSamples(),
+                        static_cast<int>(
+                            std::llround(
+                                musicalDurationSeconds
+                                * sourceSampleRate)));
+            }
+            else
+            {
+                sourceMusicalSamples =
+                    sourceBuffer.getNumSamples();
+            }
 
             loadedFileName =
                 file.getFileName();
@@ -1801,7 +1832,8 @@ private:
             hostPreviewReady =
                 false;
 
-            if (hostBpm > 0.0
+            if (sourceBpm > 0.0
+                && hostBpm > 0.0
                 && hostSampleRate > 0.0)
             {
                 scheduleHostPreviewBuild(
@@ -1883,6 +1915,7 @@ private:
         {
             if (sourceMusicalSamples <= 0
                 || sourceSampleRate <= 0.0
+                || sourceBpm <= 0.0
                 || hostSampleRate <= 0.0
                 || hostBpm <= 0.0)
             {
@@ -1954,6 +1987,9 @@ private:
             const double sourceRate =
                 sourceSampleRate;
 
+            const double sourceTempo =
+                sourceBpm;
+
             previewBuildPending =
                 false;
 
@@ -1969,6 +2005,7 @@ private:
                                 sourceSnapshot),
                         musicalSamples,
                         sourceRate,
+                        sourceTempo,
                         targetBpm,
                         targetSampleRate
                     ]() mutable
@@ -1984,6 +2021,7 @@ private:
 
                         if (musicalSamples <= 0
                             || sourceRate <= 0.0
+                            || sourceTempo <= 0.0
                             || targetBpm <= 0.0
                             || targetSampleRate <= 0.0)
                         {
@@ -1998,7 +2036,7 @@ private:
                             return result;
 
                         const double lengthRatio =
-                            sourceBpm
+                            sourceTempo
                             / targetBpm;
 
                         const int
@@ -2682,6 +2720,9 @@ private:
 
         double hostSampleRate =
             0.0;
+
+        double sourceBpm =
+            100.0;
 
         double sourceSampleRate =
             0.0;
