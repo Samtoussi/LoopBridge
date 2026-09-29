@@ -12,6 +12,8 @@
 #include <future>
 #include <limits>
 #include <memory>
+#include <map>
+#include <set>
 #include <vector>
 
 
@@ -479,45 +481,37 @@ private:
             if (loopItems.empty())
                 return false;
 
-            if (key
-                == juce::KeyPress::downKey)
+            if (key == juce::KeyPress::downKey)
             {
-                selectLoop(
-                    std::min(
-                        selectedLoopIndex + 1,
-                        static_cast<int>(
-                            loopItems.size())
-                            - 1));
-
+                selectLoop(std::min(
+                    selectedLoopIndex + 1,
+                    static_cast<int>(loopItems.size()) - 1));
+                previewSelectedLoop();
                 return true;
             }
 
-            if (key
-                == juce::KeyPress::upKey)
+            if (key == juce::KeyPress::upKey)
             {
-                selectLoop(
-                    std::max(
-                        selectedLoopIndex - 1,
-                        0));
-
+                selectLoop(std::max(selectedLoopIndex - 1, 0));
+                previewSelectedLoop();
                 return true;
             }
 
-            if (key
-                == juce::KeyPress::homeKey)
+            if (key == juce::KeyPress::homeKey)
             {
                 selectLoop(0);
                 return true;
             }
 
-            if (key
-                == juce::KeyPress::endKey)
+            if (key == juce::KeyPress::endKey)
             {
-                selectLoop(
-                    static_cast<int>(
-                        loopItems.size())
-                    - 1);
+                selectLoop(static_cast<int>(loopItems.size()) - 1);
+                return true;
+            }
 
+            if (key.getKeyCode() == ' ')
+            {
+                toggleSelectedLoopPreview();
                 return true;
             }
 
@@ -566,10 +560,74 @@ private:
                        < static_cast<int>(
                            loopItems.size()))
             {
-                selectLoop(
-                    itemIndex);
+                selectLoop(itemIndex);
+
+                const int playButtonLeft =
+                    browserLeft + 10;
+
+                const int playButtonRight =
+                    playButtonLeft + 28;
+
+                if (event.x >= playButtonLeft
+                    && event.x < playButtonRight)
+                {
+                    toggleSelectedLoopPreview();
+                }
             }
 
+            grabKeyboardFocus();
+        }
+
+        void mouseWheelMove(
+            const juce::MouseEvent& event,
+            const juce::MouseWheelDetails& wheel) override
+        {
+            if (loopItems.empty())
+                return;
+
+            const int rowsTop =
+                browserTop
+                + browserHeaderHeight;
+
+            const int rowsBottom =
+                rowsTop
+                + browserVisibleRows
+                      * browserRowHeight;
+
+            if (event.y < browserTop
+                || event.y >= rowsBottom)
+            {
+                return;
+            }
+
+            const int maxScroll =
+                std::max(
+                    0,
+                    static_cast<int>(
+                        loopItems.size())
+                        - browserVisibleRows);
+
+            if (maxScroll <= 0)
+                return;
+
+            int scrollDelta = 0;
+
+            if (wheel.deltaY < 0.0f)
+                scrollDelta = 1;
+            else if (wheel.deltaY > 0.0f)
+                scrollDelta = -1;
+
+            if (scrollDelta == 0)
+                return;
+
+            browserScrollIndex =
+                juce::jlimit(
+                    0,
+                    maxScroll,
+                    browserScrollIndex
+                        + scrollDelta);
+
+            repaint();
             grabKeyboardFocus();
         }
 
@@ -1184,7 +1242,132 @@ private:
             return "--";
         }
 
-        void loadSelectedGmailLoop()
+        juce::String getLoopCacheKey(
+            const LoopItem& item) const
+        {
+            return item.messageId
+                + "|"
+                + item.attachmentId;
+        }
+
+        juce::File getLoopCacheDirectory() const
+        {
+            auto directory =
+                juce::File::getSpecialLocation(
+                    juce::File::tempDirectory)
+                    .getChildFile("LoopBridge")
+                    .getChildFile("gmail-loops");
+
+            directory.createDirectory();
+            return directory;
+        }
+
+        double getAudioDurationSeconds(
+            const juce::File& file)
+        {
+            std::unique_ptr<juce::AudioFormatReader> reader(
+                formatManager.createReaderFor(file));
+
+            if (reader == nullptr
+                || reader->sampleRate <= 0.0)
+            {
+                return 0.0;
+            }
+
+            return static_cast<double>(reader->lengthInSamples)
+                / reader->sampleRate;
+        }
+
+        void rememberLoopDuration(
+            const juce::String& cacheKey,
+            const juce::File& file)
+        {
+            const double seconds =
+                getAudioDurationSeconds(file);
+
+            if (seconds > 0.0)
+            {
+                gmailLoopDurations[cacheKey] = seconds;
+                repaint();
+            }
+        }
+
+        static juce::String formatDuration(
+            double seconds)
+        {
+            if (seconds <= 0.0)
+                return "--";
+
+            const int totalSeconds =
+                static_cast<int>(std::llround(seconds));
+
+            const int minutes = totalSeconds / 60;
+            const int remainingSeconds = totalSeconds % 60;
+
+            return juce::String(minutes)
+                + ":"
+                + juce::String(remainingSeconds).paddedLeft('0', 2);
+        }
+
+        void prefetchLoop(
+            int index)
+        {
+            if (index < 0
+                || index >= static_cast<int>(loopItems.size()))
+                return;
+
+            const auto item =
+                loopItems[static_cast<size_t>(index)];
+
+            const auto key =
+                getLoopCacheKey(item);
+
+            const auto cached =
+                gmailLoopCache.find(key);
+
+            if (cached != gmailLoopCache.end()
+                && cached->second.existsAsFile())
+                return;
+
+            if (gmailPrefetchInFlight.count(key) > 0)
+                return;
+
+            gmailPrefetchInFlight.insert(key);
+
+            gmailClient.downloadAudioAttachment(
+                item.messageId,
+                item.attachmentId,
+                item.filename,
+                getLoopCacheDirectory(),
+                [this, key](
+                    const juce::File& file,
+                    const juce::String& error)
+                {
+                    gmailPrefetchInFlight.erase(key);
+
+                    if (error.isEmpty()
+                        && file.existsAsFile())
+                    {
+                        gmailLoopCache[key] = file;
+                        rememberLoopDuration(key, file);
+                    }
+                });
+        }
+
+        void prefetchAroundLoop(
+            int centreIndex)
+        {
+            // Keep the immediate neighbours warm. This is intentionally
+            // conservative so arrow-key browsing feels instant without
+            // hammering the Gmail API or downloading the whole inbox.
+            prefetchLoop(centreIndex - 2);
+            prefetchLoop(centreIndex - 1);
+            prefetchLoop(centreIndex + 1);
+            prefetchLoop(centreIndex + 2);
+        }
+
+        void loadSelectedGmailLoop(
+            bool autoPlay = false)
         {
             if (selectedLoopIndex < 0
                 || selectedLoopIndex
@@ -1194,10 +1377,64 @@ private:
                 return;
             }
 
+            const int requestedIndex = selectedLoopIndex;
+
             const auto item =
                 loopItems[
                     static_cast<size_t>(
                         selectedLoopIndex)];
+
+            const auto requestId = ++previewRequestId;
+            const auto cacheKey = getLoopCacheKey(item);
+
+            const auto useFile =
+                [this, item, requestedIndex, autoPlay, requestId](
+                    const juce::File& file)
+                {
+                    if (!file.existsAsFile())
+                        return;
+
+                    gmailStatus =
+                        "GMAIL: LOADED "
+                        + item.filename;
+
+                    rememberLoopDuration(
+                        getLoopCacheKey(item),
+                        file);
+
+                    loadAudioFile(
+                        file,
+                        item.bpm.has_value()
+                            ? *item.bpm
+                            : 0.0);
+
+                    loadedBrowserLoopIndex = requestedIndex;
+
+                    prefetchAroundLoop(requestedIndex);
+
+                    if (autoPlay
+                        && requestId == previewRequestId)
+                    {
+                        startSoloPreview();
+                    }
+
+                    grabKeyboardFocus();
+                    repaint();
+                };
+
+            const auto cached =
+                gmailLoopCache.find(cacheKey);
+
+            if (cached != gmailLoopCache.end()
+                && cached->second.existsAsFile())
+            {
+                gmailStatus =
+                    "GMAIL: CACHED "
+                    + item.filename;
+
+                useFile(cached->second);
+                return;
+            }
 
             gmailStatus =
                 "GMAIL: DOWNLOADING "
@@ -1205,19 +1442,12 @@ private:
 
             repaint();
 
-            const auto cacheDirectory =
-                juce::File::getSpecialLocation(
-                    juce::File::tempDirectory)
-                    .getChildFile("LoopBridge");
-            
-            cacheDirectory.createDirectory();
-            
             gmailClient.downloadAudioAttachment(
                 item.messageId,
                 item.attachmentId,
                 item.filename,
-                cacheDirectory,
-                [this, item](
+                getLoopCacheDirectory(),
+                [this, item, requestedIndex, autoPlay, requestId, cacheKey, useFile](
                     const juce::File& file,
                     const juce::String& error)
                 {
@@ -1244,23 +1474,75 @@ private:
                         return;
                     }
 
-                    gmailStatus =
-                        "GMAIL: LOADED "
-                        + item.filename;
+                    gmailLoopCache[cacheKey] = file;
+                    rememberLoopDuration(cacheKey, file);
 
                     juce::Logger::writeToLog(
                         "GMAIL LOOP DOWNLOADED: "
                         + file.getFullPathName());
 
-                    loadAudioFile(
-                        file,
-                        item.bpm.has_value()
-                            ? *item.bpm
-                            : 0.0);
-
-                    grabKeyboardFocus();
-                    repaint();
+                    useFile(file);
                 });
+        }
+
+
+        void previewSelectedLoop()
+        {
+            if (selectedLoopIndex < 0
+                || selectedLoopIndex >= static_cast<int>(loopItems.size()))
+                return;
+
+            if (loadedBrowserLoopIndex == selectedLoopIndex
+                && soloBuffer.getNumSamples() > 0)
+            {
+                startSoloPreview();
+                return;
+            }
+
+            loadSelectedGmailLoop(true);
+        }
+
+        void pauseSoloPreview()
+        {
+            {
+                const juce::ScopedLock lock(audioLock);
+                soloPlaying = false;
+            }
+
+            playButton.setEnabled(sourceMusicalSamples > 0);
+            stopButton.setEnabled(soloPlaybackPosition > 0);
+            repaint();
+        }
+
+        void toggleSelectedLoopPreview()
+        {
+            if (selectedLoopIndex < 0
+                || selectedLoopIndex >= static_cast<int>(loopItems.size()))
+                return;
+
+            if (loadedBrowserLoopIndex != selectedLoopIndex
+                || soloBuffer.getNumSamples() <= 0)
+            {
+                previewSelectedLoop();
+                return;
+            }
+
+            if (soloPlaying)
+            {
+                pauseSoloPreview();
+                return;
+            }
+
+            {
+                const juce::ScopedLock lock(audioLock);
+                if (soloPlaybackPosition >= soloBuffer.getNumSamples())
+                    soloPlaybackPosition = 0;
+                soloPlaying = true;
+            }
+
+            playButton.setEnabled(false);
+            stopButton.setEnabled(true);
+            repaint();
         }
 
         void selectLoop(
@@ -1382,23 +1664,31 @@ private:
                 juce::Colours::white
                     .withAlpha(0.55f));
 
+            const int playX =
+                browserLeft + 10;
+
             const int filenameX =
-                browserLeft + 14;
+                browserLeft + 46;
 
             const int senderX =
                 browserLeft
                 + browserWidth
-                - 330;
+                - 410;
 
             const int bpmX =
                 browserLeft
                 + browserWidth
-                - 180;
+                - 250;
 
             const int keyX =
                 browserLeft
                 + browserWidth
-                - 90;
+                - 170;
+
+            const int durationX =
+                browserLeft
+                + browserWidth
+                - 82;
 
             g.drawText(
                 "LOOP",
@@ -1434,6 +1724,15 @@ private:
                 keyX,
                 browserTop,
                 75,
+                browserHeaderHeight,
+                juce::Justification::
+                    centredLeft);
+
+            g.drawText(
+                "DURATION",
+                durationX,
+                browserTop,
+                76,
                 browserHeaderHeight,
                 juce::Justification::
                     centredLeft);
@@ -1552,6 +1851,42 @@ private:
                         : juce::Colours::white
                               .withAlpha(0.82f));
 
+                const bool thisLoopPlaying =
+                    itemIndex == loadedBrowserLoopIndex
+                    && soloPlaying;
+
+                g.setColour(
+                    thisLoopPlaying
+                        ? juce::Colours::lightgreen
+                        : juce::Colours::cornflowerblue);
+
+                g.setFont(
+                    juce::Font(
+                        juce::FontOptions(
+                            16.0f,
+                            juce::Font::bold)));
+
+                g.drawText(
+                    thisLoopPlaying ? "||" : ">",
+                    playX,
+                    rowY,
+                    28,
+                    browserRowHeight,
+                    juce::Justification::centred);
+
+                g.setFont(
+                    juce::Font(
+                        juce::FontOptions(
+                            12.5f,
+                            selected
+                                ? juce::Font::bold
+                                : juce::Font::plain)));
+
+                g.setColour(
+                    selected
+                        ? juce::Colours::white
+                        : juce::Colours::white.withAlpha(0.82f));
+
                 g.drawFittedText(
                     item.filename,
                     filenameX,
@@ -1626,6 +1961,28 @@ private:
                     juce::Justification::
                         centredLeft,
                     1);
+
+                const auto durationIt =
+                    gmailLoopDurations.find(
+                        getLoopCacheKey(item));
+
+                const juce::String durationText =
+                    durationIt != gmailLoopDurations.end()
+                        ? formatDuration(durationIt->second)
+                        : "--";
+
+                g.setColour(
+                    durationIt != gmailLoopDurations.end()
+                        ? juce::Colours::white.withAlpha(0.72f)
+                        : juce::Colours::white.withAlpha(0.3f));
+
+                g.drawText(
+                    durationText,
+                    durationX,
+                    rowY,
+                    76,
+                    browserRowHeight,
+                    juce::Justification::centredLeft);
 
                 g.setColour(
                     juce::Colours::white
@@ -1742,6 +2099,9 @@ private:
 
                     if (!file.existsAsFile())
                         return;
+
+                    loadedBrowserLoopIndex = -1;
+                    ++previewRequestId;
 
                     loadAudioFile(
                         file,
@@ -2826,6 +3186,21 @@ private:
             -1;
 
         int browserScrollIndex =
+            0;
+
+        std::map<juce::String, juce::File>
+            gmailLoopCache;
+
+        std::set<juce::String>
+            gmailPrefetchInFlight;
+
+        std::map<juce::String, double>
+            gmailLoopDurations;
+
+        int loadedBrowserLoopIndex =
+            -1;
+
+        uint64_t previewRequestId =
             0;
     };
 
