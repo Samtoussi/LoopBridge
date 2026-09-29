@@ -3,6 +3,7 @@
 #include <cstring>
 #include <random>
 #include <string>
+#include <vector>
 
 #if JUCE_WINDOWS
  #include <winsock2.h>
@@ -127,33 +128,87 @@ namespace
         juce::String encoded,
         juce::MemoryBlock& output)
     {
-        encoded =
-            encoded.trim();
+        encoded = encoded.trim();
 
         if (encoded.isEmpty())
-        {
             return false;
-        }
-
-        encoded =
-            encoded.replaceCharacter(
-                '-',
-                '+');
-
-        encoded =
-            encoded.replaceCharacter(
-                '_',
-                '/');
-
-        while ((encoded.length() % 4) != 0)
-        {
-            encoded += "=";
-        }
 
         output.reset();
 
-        return output.fromBase64Encoding(
-            encoded);
+        std::vector<unsigned char> decoded;
+        decoded.reserve(
+            static_cast<size_t>(
+                encoded.length() * 3 / 4));
+
+        unsigned int buffer = 0;
+        int bitsInBuffer = 0;
+
+        for (auto character : encoded)
+        {
+            int value = -1;
+
+            if (character >= 'A'
+                && character <= 'Z')
+            {
+                value = character - 'A';
+            }
+            else if (character >= 'a'
+                    && character <= 'z')
+            {
+                value =
+                    character - 'a' + 26;
+            }
+            else if (character >= '0'
+                    && character <= '9')
+            {
+                value =
+                    character - '0' + 52;
+            }
+            else if (character == '-'
+                    || character == '+')
+            {
+                value = 62;
+            }
+            else if (character == '_'
+                    || character == '/')
+            {
+                value = 63;
+            }
+            else if (character == '=')
+            {
+                break;
+            }
+            else
+            {
+                return false;
+            }
+
+            buffer =
+                (buffer << 6)
+                | static_cast<unsigned int>(
+                    value);
+
+            bitsInBuffer += 6;
+
+            if (bitsInBuffer >= 8)
+            {
+                bitsInBuffer -= 8;
+
+                decoded.push_back(
+                    static_cast<unsigned char>(
+                        (buffer >> bitsInBuffer)
+                        & 0xff));
+            }
+        }
+
+        if (decoded.empty())
+            return false;
+
+        output.append(
+            decoded.data(),
+            decoded.size());
+
+        return true;
     }
 
 #if JUCE_WINDOWS
@@ -1680,30 +1735,55 @@ GmailClient::base64UrlEncode(
     const void* data,
     size_t size)
 {
-    juce::MemoryBlock block(
-        data,
-        size);
+    static constexpr char alphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        "abcdefghijklmnopqrstuvwxyz"
+        "0123456789-_";
 
-    auto encoded =
-        block.toBase64Encoding();
+    const auto* bytes =
+        static_cast<const unsigned char*>(
+            data);
 
-    encoded =
-        encoded.replaceCharacter(
-            '+',
-            '-');
+    juce::String result;
 
-    encoded =
-        encoded.replaceCharacter(
-            '/',
-            '_');
-
-    while (encoded.endsWithChar(
-        '='))
+    for (size_t i = 0; i < size; i += 3)
     {
-        encoded =
-            encoded.dropLastCharacters(
-                1);
+        const unsigned int byte0 =
+            bytes[i];
+
+        const unsigned int byte1 =
+            (i + 1 < size)
+                ? bytes[i + 1]
+                : 0;
+
+        const unsigned int byte2 =
+            (i + 2 < size)
+                ? bytes[i + 2]
+                : 0;
+
+        const unsigned int value =
+            (byte0 << 16)
+            | (byte1 << 8)
+            | byte2;
+
+        result += alphabet[
+            (value >> 18) & 0x3f];
+
+        result += alphabet[
+            (value >> 12) & 0x3f];
+
+        if (i + 1 < size)
+        {
+            result += alphabet[
+                (value >> 6) & 0x3f];
+        }
+
+        if (i + 2 < size)
+        {
+            result += alphabet[
+                value & 0x3f];
+        }
     }
 
-    return encoded;
+    return result;
 }

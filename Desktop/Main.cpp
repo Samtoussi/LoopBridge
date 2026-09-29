@@ -521,10 +521,7 @@ private:
                 return true;
             }
 
-            if (key
-                    == juce::KeyPress::returnKey
-                || key
-                    == juce::KeyPress::numberPadEnter)
+            if (key == juce::KeyPress::returnKey)
             {
                 loadSelectedGmailLoop();
                 return true;
@@ -1192,10 +1189,18 @@ private:
 
             repaint();
 
+            const auto cacheDirectory =
+                juce::File::getSpecialLocation(
+                    juce::File::tempDirectory)
+                    .getChildFile("LoopBridge");
+            
+            cacheDirectory.createDirectory();
+            
             gmailClient.downloadAudioAttachment(
                 item.messageId,
                 item.attachmentId,
                 item.filename,
+                cacheDirectory,
                 [this, item](
                     const juce::File& file,
                     const juce::String& error)
