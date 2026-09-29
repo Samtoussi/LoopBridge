@@ -1,5 +1,6 @@
 #include "MetadataParser.h"
 
+#include <cmath>
 #include <iostream>
 #include <vector>
 
@@ -37,6 +38,10 @@ int main()
 {
     const std::vector<TestCase> tests =
     {
+        // --------------------------------------------------
+        // Existing explicit-BPM cases
+        // --------------------------------------------------
+
         {
             "Past Thoughts 154bpm.wav",
             154.0,
@@ -88,9 +93,64 @@ int main()
             "A minor"
         },
 
-        // BPM typo / invalid value.
+        // --------------------------------------------------
+        // Real Gmail filename patterns
+        // --------------------------------------------------
+
+        {
+            "(rylo) sure you are 159 a#m season.mp3",
+            159.0,
+            "A# minor"
+        },
+        {
+            "(pain) pray for me 167 season.mp3",
+            167.0,
+            ""
+        },
+        {
+            "(veeze foxbd) walka 147 em season.mp3",
+            147.0,
+            "E minor"
+        },
+        {
+            "(unique) feel 180 amin season.mp3",
+            180.0,
+            "A minor"
+        },
+        {
+            "(yb unique) unison 151 season.mp3",
+            151.0,
+            ""
+        },
+
+        // --------------------------------------------------
+        // Guardrails
+        // --------------------------------------------------
+
+        // Explicit BPM typo / invalid value.
         {
             "KAYN GREY 1348BPM.mp3",
+            std::nullopt,
+            ""
+        },
+
+        // Bare number below plausible BPM range.
+        {
+            "Sample 11 Gmin.wav",
+            std::nullopt,
+            "G minor"
+        },
+
+        // Bare number above plausible BPM range.
+        {
+            "loop version 350.wav",
+            std::nullopt,
+            ""
+        },
+
+        // Multiple plausible bare numbers are ambiguous.
+        {
+            "loop 120 version 140.wav",
             std::nullopt,
             ""
         },
@@ -100,9 +160,7 @@ int main()
             "cool melody idea.wav",
             std::nullopt,
             ""
-        },
-
-        // Subject fallback test is handled separately below.
+        }
     };
 
     int passed = 0;

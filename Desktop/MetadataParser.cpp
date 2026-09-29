@@ -56,6 +56,10 @@ MetadataParser::parseBpm(
     const std::string input =
         text.toStdString();
 
+    // --------------------------------------------------
+    // Explicit BPM
+    // --------------------------------------------------
+    //
     // Handles:
     //
     // 154bpm
@@ -63,9 +67,7 @@ MetadataParser::parseBpm(
     // 154-bpm
     // BPM 154
     //
-    // We intentionally require "bpm" here.
-    // Bare numbers will be handled later only if
-    // we have a strong reason to support them.
+    // Explicit BPM always gets priority.
 
     static const std::regex
         numberBeforeBpm(
@@ -89,36 +91,98 @@ MetadataParser::parseBpm(
         bpm =
             std::stod(
                 match[1].str());
+
+        if (bpm >= 40.0
+            && bpm <= 300.0)
+        {
+            return bpm;
+        }
+
+        return std::nullopt;
     }
-    else if (std::regex_search(
-                 input,
-                 match,
-                 bpmBeforeNumber))
+
+    if (std::regex_search(
+            input,
+            match,
+            bpmBeforeNumber))
     {
         bpm =
             std::stod(
                 match[1].str());
-    }
-    else
-    {
+
+        if (bpm >= 40.0
+            && bpm <= 300.0)
+        {
+            return bpm;
+        }
+
         return std::nullopt;
     }
 
-    // Sanity guard.
+    // --------------------------------------------------
+    // Bare BPM
+    // --------------------------------------------------
     //
-    // This deliberately rejects things such as the
-    // real-world "1348BPM" typo we saw.
+    // Real LoopBridge Gmail filenames often look like:
     //
-    // 40-300 is broad enough that we're not making
-    // genre assumptions here.
+    // (rylo) sure you are 159 a#m season.mp3
+    // (pain) pray for me 167 season.mp3
+    // (veeze foxbd) walka 147 em season.mp3
+    // (unique) feel 180 amin season.mp3
+    // (yb unique) unison 151 season.mp3
+    //
+    // There is no literal "bpm", so we allow a bare
+    // integer only when it looks strongly like tempo:
+    //
+    // - exactly 2 or 3 digits
+    // - standalone numeric token
+    // - between 40 and 300
+    //
+    // We collect all candidates instead of blindly taking
+    // the first number. A filename containing more than one
+    // plausible bare tempo is considered ambiguous and is
+    // rejected.
 
-    if (bpm < 40.0
-        || bpm > 300.0)
+    static const std::regex
+        bareNumber(
+            R"((?:^|[^0-9])(\d{2,3})(?=$|[^0-9]))");
+
+    auto begin =
+        std::sregex_iterator(
+            input.begin(),
+            input.end(),
+            bareNumber);
+
+    const auto end =
+        std::sregex_iterator();
+
+    std::optional<double> candidate;
+
+    for (auto it = begin;
+         it != end;
+         ++it)
     {
-        return std::nullopt;
+        const auto value =
+            std::stod(
+                (*it)[1].str());
+
+        if (value < 40.0
+            || value > 300.0)
+        {
+            continue;
+        }
+
+        // More than one plausible bare BPM means we do not
+        // have enough information to safely choose one.
+        if (candidate.has_value())
+        {
+            return std::nullopt;
+        }
+
+        candidate = value;
     }
 
-    return bpm;
+    return candidate;
 }
 
 juce::String
