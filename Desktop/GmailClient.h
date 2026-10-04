@@ -5,6 +5,8 @@
 #include <functional>
 #include <memory>
 #include <vector>
+#include <atomic>
+#include <map>
 
 class GmailAuthThread;
 
@@ -43,6 +45,16 @@ public:
             const juce::File&,
             const juce::String&)>;
 
+    enum class Priority { preview, download, prefetch };
+
+    struct RequestError
+    {
+        int httpStatus = 0;
+        juce::String reason;
+        juce::var details;
+        juce::String message;
+    };
+
     GmailClient();
     ~GmailClient();
 
@@ -64,10 +76,42 @@ public:
         const juce::String& attachmentId,
         const juce::String& filename,
         const juce::File& destinationDirectory,
-        DownloadCallback callback) const;
+        DownloadCallback callback,
+        Priority priority = Priority::preview,
+        const juce::File& localFile = {});
+
+    void discardQueuedNavigation(const juce::String& keepKey = {});
+    void saveAttachment(const juce::File& file, const juce::File& directory,
+                        DownloadCallback callback);
+    void shutdown();
+    uint64_t getSessionGeneration() const { return lifetime->generation.load(); }
+    const RequestError& getLastRequestError() const { return lastRequestError; }
+
+    static juce::File getAttachmentCacheFile(
+        const juce::String& messageId, const juce::String& attachmentId,
+        const juce::String& filename, const juce::File& directory);
 
 private:
     friend class GmailAuthThread;
+#if defined(LOOPBRIDGE_GMAIL_TESTS)
+    friend int runGmailClientTests();
+#endif
+
+    struct Lifetime
+    {
+        std::atomic<bool> alive { true };
+        std::atomic<uint64_t> generation { 0 };
+    };
+    class Worker;
+    struct PendingAttachment
+    {
+        std::vector<DownloadCallback> callbacks;
+    };
+    std::shared_ptr<Lifetime> lifetime = std::make_shared<Lifetime>();
+    std::unique_ptr<Worker> worker;
+    // Message-thread-only: workers capture immutable request data.
+    std::map<juce::String, std::shared_ptr<PendingAttachment>> pendingAttachments;
+    RequestError lastRequestError; // Message-thread-only structured diagnostics.
 
     struct OAuthCredentials
     {
@@ -97,14 +141,23 @@ private:
     void handleAuthorizationCode(
         const juce::String& code);
 
-    bool exchangeCodeForTokens(
+    static bool exchangeCodeForTokens(
         const juce::String& code,
-        TokenData& tokens);
+        TokenData& tokens, const OAuthCredentials& credentials,
+        const juce::String& codeVerifier, const juce::String& redirectUri,
+        Worker& worker);
 
-    bool performAuthorizedGet(
+    static bool performAuthorizedGet(
         const juce::String& url,
         juce::var& jsonResult,
-        juce::String& errorMessage) const;
+        juce::String& errorMessage, const juce::String& accessToken, Worker& worker);
+
+    static void fetchRecentAudioAttachmentsSync(int maxMessages,
+        AudioListCallback callback, const juce::String& accessToken, Worker& worker);
+    static void downloadAudioAttachmentSync(const juce::String& messageId,
+        const juce::String& attachmentId, const juce::String& filename,
+        const juce::File& destinationDirectory, DownloadCallback callback,
+        const juce::String& accessToken, Worker& worker);
 
     static juce::String getHeaderValue(
         const juce::var& headers,

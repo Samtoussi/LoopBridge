@@ -130,8 +130,17 @@ private:
             playButton.onClick =
                 [this]
                 {
+                    if (pendingBrowserPreview.isNotEmpty())
+                    {
+                        cancelPendingBrowserPreview();
+                        hostPreviewEnabled = false;
+                        stopSoloPreview();
+                        sendPreviewState();
+                        return;
+                    }
                     if (bridgeEnabled)
                     {
+                        cancelPendingBrowserPreview();
                         hostPreviewEnabled = !hostPreviewEnabled;
                         stopSoloPreview();
                         sendPreviewState();
@@ -143,6 +152,7 @@ private:
             stopButton.onClick =
                 [this]
                 {
+                    cancelPendingBrowserPreview();
                     if (bridgeEnabled)
                     {
                         hostPreviewEnabled = false;
@@ -178,6 +188,9 @@ private:
                     {
                         gmailClient.disconnect();
                         pendingPrefetchCentre = -1;
+                        cancelPendingBrowserPreview();
+                        downloadsInFlight.clear();
+                        loadedBrowserLoopIndex = -1;
 
                         gmailButton.setButtonText(
                             "CONNECT GMAIL");
@@ -193,6 +206,10 @@ private:
                         return;
                     }
 
+                    cancelPendingBrowserPreview();
+                    downloadsInFlight.clear();
+                    pendingPrefetchCentre = -1;
+                    gmailClient.discardQueuedNavigation();
                     gmailButton.setEnabled(false);
 
                     gmailStatus =
@@ -403,6 +420,7 @@ private:
         ~MainComponent() override
         {
             stopTimer();
+            gmailClient.shutdown();
 
             if (previewBuildFuture.valid())
             {
@@ -1373,7 +1391,6 @@ private:
                     .getChildFile("LoopBridge")
                     .getChildFile("gmail-loops");
 
-            directory.createDirectory();
             return directory;
         }
 
@@ -1398,9 +1415,36 @@ private:
             directory.findChildFiles(
                 files, juce::File::findFiles, false);
 
-            return files.isEmpty()
-                ? juce::File{}
-                : files.getFirst();
+            for (const auto& file : files)
+                if (file.getSize() > 0)
+                    return file;
+            return {};
+        }
+
+        void acquireLoop(const LoopItem& item, GmailClient::Priority priority,
+                         GmailClient::DownloadCallback callback)
+        {
+            const auto key = getLoopCacheKey(item);
+            const auto saved = getDownloadedLoopFile(item);
+            const auto cached = gmailLoopCache.find(key);
+            const auto local = saved.existsAsFile() ? saved
+                : cached != gmailLoopCache.end() ? cached->second : juce::File{};
+            const auto session = gmailClient.getSessionGeneration();
+            const juce::Component::SafePointer<MainComponent> safeThis(this);
+            gmailClient.downloadAudioAttachment(item.messageId, item.attachmentId, item.filename,
+                getLoopCacheDirectory(),
+                [safeThis, session, key, callback](const juce::File& file, const juce::String& error)
+                {
+                    if (safeThis == nullptr
+                        || safeThis->gmailClient.getSessionGeneration() != session)
+                        return;
+                    if (error.isEmpty() && file.existsAsFile())
+                    {
+                        safeThis->gmailLoopCache[key] = file;
+                        safeThis->rememberLoopDuration(key, file);
+                    }
+                    callback(file, error);
+                }, priority, local);
         }
 
         void downloadSelectedLoop()
@@ -1418,12 +1462,6 @@ private:
                 return;
 
             const auto directory = getDownloadedLoopDirectory(item);
-            if (!directory.createDirectory())
-            {
-                gmailStatus = "DOWNLOAD ERROR: COULD NOT CREATE FOLDER";
-                repaint();
-                return;
-            }
 
             downloadsInFlight.insert(key);
             repaint();
@@ -1442,25 +1480,8 @@ private:
                 repaint();
             };
 
-            const auto cached = gmailLoopCache.find(key);
-            if (cached != gmailLoopCache.end()
-                && cached->second.existsAsFile())
-            {
-                const auto target = directory.getChildFile(
-                    cached->second.getFileName());
-                const bool copied = cached->second.copyFileTo(target);
-                finish(copied ? target : juce::File{},
-                       copied ? juce::String{}
-                              : juce::String("COULD NOT SAVE FILE"));
-                return;
-            }
-
-            gmailClient.downloadAudioAttachment(
-                item.messageId,
-                item.attachmentId,
-                item.filename,
-                getLoopCacheDirectory(),
-                [this, key, directory, finish](
+            acquireLoop(item, GmailClient::Priority::download,
+                [this, directory, finish](
                     const juce::File& file,
                     const juce::String& error)
                 {
@@ -1470,15 +1491,7 @@ private:
                         return;
                     }
 
-                    gmailLoopCache[key] = file;
-                    rememberLoopDuration(key, file);
-
-                    const auto target = directory.getChildFile(
-                        file.getFileName());
-                    const bool copied = file.copyFileTo(target);
-                    finish(copied ? target : juce::File{},
-                           copied ? juce::String{}
-                                  : juce::String("COULD NOT SAVE FILE"));
+                    gmailClient.saveAttachment(file, directory, finish);
                 });
         }
 
@@ -1502,6 +1515,8 @@ private:
             const juce::String& cacheKey,
             const juce::File& file)
         {
+            if (gmailLoopDurations.count(cacheKey) > 0)
+                return;
             const double seconds =
                 getAudioDurationSeconds(file);
 
@@ -1539,47 +1554,8 @@ private:
             const auto item =
                 loopItems[static_cast<size_t>(index)];
 
-            const auto key =
-                getLoopCacheKey(item);
-
-            const auto downloaded = getDownloadedLoopFile(item);
-            if (downloaded.existsAsFile())
-            {
-                gmailLoopCache[key] = downloaded;
-                rememberLoopDuration(key, downloaded);
-                return;
-            }
-
-            const auto cached =
-                gmailLoopCache.find(key);
-
-            if (cached != gmailLoopCache.end()
-                && cached->second.existsAsFile())
-                return;
-
-            if (gmailPrefetchInFlight.count(key) > 0)
-                return;
-
-            gmailPrefetchInFlight.insert(key);
-
-            gmailClient.downloadAudioAttachment(
-                item.messageId,
-                item.attachmentId,
-                item.filename,
-                getLoopCacheDirectory(),
-                [this, key](
-                    const juce::File& file,
-                    const juce::String& error)
-                {
-                    gmailPrefetchInFlight.erase(key);
-
-                    if (error.isEmpty()
-                        && file.existsAsFile())
-                    {
-                        gmailLoopCache[key] = file;
-                        rememberLoopDuration(key, file);
-                    }
-                });
+            acquireLoop(item, GmailClient::Priority::prefetch,
+                [](const juce::File&, const juce::String&) {});
         }
 
         void prefetchAroundLoop(
@@ -1612,21 +1588,22 @@ private:
 
             const auto requestId = ++previewRequestId;
             const auto cacheKey = getLoopCacheKey(item);
+            const auto session = gmailClient.getSessionGeneration();
+            pendingBrowserPreview = cacheKey;
+            pendingBrowserAutoPlay = autoPlay;
 
             const auto useFile =
-                [this, item, requestedIndex, autoPlay, requestId](
+                [this, item, requestedIndex, autoPlay, requestId, cacheKey, session](
                     const juce::File& file)
                 {
-                    if (!file.existsAsFile())
+                    if (!isCurrentPreview(requestedIndex, cacheKey, requestId, session)
+                        || !file.existsAsFile())
                         return;
+                    pendingBrowserPreview.clear();
 
                     gmailStatus =
                         "GMAIL: LOADED "
                         + item.filename;
-
-                    rememberLoopDuration(
-                        getLoopCacheKey(item),
-                        file);
 
                     loadAudioFile(
                         file,
@@ -1648,45 +1625,22 @@ private:
                     repaint();
                 };
 
-            const auto downloaded = getDownloadedLoopFile(item);
-            if (downloaded.existsAsFile())
-            {
-                gmailLoopCache[cacheKey] = downloaded;
-                useFile(downloaded);
-                return;
-            }
-
-            const auto cached =
-                gmailLoopCache.find(cacheKey);
-
-            if (cached != gmailLoopCache.end()
-                && cached->second.existsAsFile())
-            {
-                gmailStatus =
-                    "GMAIL: CACHED "
-                    + item.filename;
-
-                useFile(cached->second);
-                return;
-            }
-
             gmailStatus =
                 "GMAIL: DOWNLOADING "
                 + item.filename;
 
             repaint();
 
-            gmailClient.downloadAudioAttachment(
-                item.messageId,
-                item.attachmentId,
-                item.filename,
-                getLoopCacheDirectory(),
-                [this, item, requestedIndex, autoPlay, requestId, cacheKey, useFile](
+            acquireLoop(item, GmailClient::Priority::preview,
+                [this, requestedIndex, requestId, cacheKey, session, useFile](
                     const juce::File& file,
                     const juce::String& error)
                 {
+                    if (!isCurrentPreview(requestedIndex, cacheKey, requestId, session))
+                        return;
                     if (error.isNotEmpty())
                     {
+                        pendingBrowserPreview.clear();
                         gmailStatus =
                             "GMAIL ERROR: "
                             + error;
@@ -1701,15 +1655,13 @@ private:
 
                     if (!file.existsAsFile())
                     {
+                        pendingBrowserPreview.clear();
                         gmailStatus =
                             "GMAIL ERROR: DOWNLOADED FILE NOT FOUND";
 
                         repaint();
                         return;
                     }
-
-                    gmailLoopCache[cacheKey] = file;
-                    rememberLoopDuration(cacheKey, file);
 
                     juce::Logger::writeToLog(
                         "GMAIL LOOP DOWNLOADED: "
@@ -1719,6 +1671,21 @@ private:
                 });
         }
 
+        bool isCurrentPreview(int index, const juce::String& key,
+                              uint64_t request, uint64_t session) const
+        {
+            return request == previewRequestId
+                && session == gmailClient.getSessionGeneration()
+                && index == selectedLoopIndex && index >= 0
+                && index < static_cast<int>(loopItems.size())
+                && key == getLoopCacheKey(loopItems[static_cast<size_t>(index)]);
+        }
+
+        void cancelPendingBrowserPreview()
+        {
+            ++previewRequestId;
+            pendingBrowserPreview.clear();
+        }
 
         void previewSelectedLoop()
         {
@@ -1753,6 +1720,16 @@ private:
             if (selectedLoopIndex < 0
                 || selectedLoopIndex >= static_cast<int>(loopItems.size()))
                 return;
+
+            if (pendingBrowserPreview == getLoopCacheKey(
+                    loopItems[static_cast<size_t>(selectedLoopIndex)]))
+            {
+                cancelPendingBrowserPreview();
+                hostPreviewEnabled = false;
+                stopSoloPreview();
+                sendPreviewState();
+                return;
+            }
 
             if (loadedBrowserLoopIndex != selectedLoopIndex
                 || soloBuffer.getNumSamples() <= 0)
@@ -1794,6 +1771,9 @@ private:
             pendingPrefetchCentre = -1;
             if (index != selectedLoopIndex)
             {
+                cancelPendingBrowserPreview();
+                gmailClient.discardQueuedNavigation(index >= 0 && index < static_cast<int>(loopItems.size())
+                    ? getLoopCacheKey(loopItems[static_cast<size_t>(index)]) : juce::String{});
                 ++sourceGeneration;
                 previewBuildPending = false;
                 stretching = previewBuildRunning;
@@ -2380,6 +2360,8 @@ private:
 
                     loadedBrowserLoopIndex = -1;
                     pendingPrefetchCentre = -1;
+                    gmailClient.discardQueuedNavigation();
+                    pendingBrowserPreview.clear();
                     ++previewRequestId;
 
                     loadAudioFile(
@@ -3380,7 +3362,13 @@ private:
                 sendPreviewState();
                 previewStateSentMs = juce::Time::getMillisecondCounterHiRes();
             }
-            if (bridgeEnabled)
+            if (pendingBrowserPreview.isNotEmpty())
+            {
+                playButton.setButtonText(pendingBrowserAutoPlay ? "Pause" : "Cancel");
+                playButton.setEnabled(true);
+                stopButton.setEnabled(true);
+            }
+            else if (bridgeEnabled)
             {
                 playButton.setButtonText(hostPreviewEnabled ? "Pause" : "Play");
                 playButton.setEnabled(sourceMusicalSamples > 0);
@@ -3571,9 +3559,6 @@ private:
         std::map<juce::String, juce::File>
             gmailLoopCache;
 
-        std::set<juce::String>
-            gmailPrefetchInFlight;
-
         int pendingPrefetchCentre = -1;
         int pendingPrefetchStep = 0;
         double prefetchRequestedMs = 0.0;
@@ -3589,6 +3574,8 @@ private:
 
         uint64_t previewRequestId =
             0;
+        juce::String pendingBrowserPreview;
+        bool pendingBrowserAutoPlay = false;
     };
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(

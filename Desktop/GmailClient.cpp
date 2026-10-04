@@ -4,6 +4,10 @@
 #include <random>
 #include <string>
 #include <vector>
+#include <algorithm>
+#if defined(LOOPBRIDGE_GMAIL_TESTS)
+ #include <iostream>
+#endif
 
 #if JUCE_WINDOWS
  #include <winsock2.h>
@@ -274,15 +278,17 @@ namespace
     }
 
     juce::String readHttpRequest(
-        SOCKET socketHandle)
+        SOCKET socketHandle, juce::Thread& thread)
     {
         std::string request;
 
         char buffer[2048];
+        const double deadline = juce::Time::getMillisecondCounterHiRes() + 5000.0;
 
         while (
             request.find("\r\n\r\n")
-            == std::string::npos)
+            == std::string::npos && !thread.threadShouldExit()
+            && juce::Time::getMillisecondCounterHiRes() < deadline)
         {
             const int received =
                 recv(
@@ -392,6 +398,223 @@ namespace
 #endif
 }
 
+class GmailClient::Worker final : public juce::Thread
+{
+public:
+    struct Job
+    {
+        juce::String key;
+        GmailClient::Priority priority;
+        uint64_t generation;
+        std::function<void(Worker&)> run;
+        std::function<void()> cancelled;
+        bool explicitDownload = false;
+    };
+
+    explicit Worker(std::shared_ptr<Lifetime> state)
+        : juce::Thread("LoopBridge Gmail requests"), lifetime(std::move(state))
+    {
+        startThread();
+    }
+
+    ~Worker() override
+    {
+        signalThreadShouldExit();
+        notify();
+        {
+            const juce::ScopedLock lock(streamLock);
+            if (activeStream != nullptr)
+                activeStream->cancel();
+        }
+        // Never forcibly terminate a thread that owns files or HTTP resources.
+        stopThread(-1);
+    }
+
+    void enqueue(Job job)
+    {
+        const juce::ScopedLock lock(queueLock);
+        job.explicitDownload = job.priority == GmailClient::Priority::download && job.key.isNotEmpty();
+        jobs.push_back(std::move(job));
+        notify();
+    }
+
+    void promote(const juce::String& key, GmailClient::Priority priority)
+    {
+        const juce::ScopedLock lock(queueLock);
+        for (auto& job : jobs)
+            if (job.key == key)
+            {
+                if (priority == GmailClient::Priority::download)
+                    job.explicitDownload = true;
+                if (priority < job.priority)
+                    job.priority = priority;
+            }
+        notify();
+    }
+
+    std::vector<juce::String> discardNavigation(const juce::String& keepKey)
+    {
+        std::vector<Job> removed;
+        std::vector<juce::String> keys;
+        {
+            const juce::ScopedLock lock(queueLock);
+            for (auto it = jobs.begin(); it != jobs.end();)
+            {
+                if (it->key != keepKey && it->explicitDownload
+                    && it->priority == GmailClient::Priority::preview)
+                    it->priority = GmailClient::Priority::download;
+                if (it->key.isNotEmpty() && it->key != keepKey && !it->explicitDownload
+                    && (it->priority == GmailClient::Priority::prefetch
+                        || it->priority == GmailClient::Priority::preview))
+                {
+                    keys.push_back(it->key);
+                    removed.push_back(std::move(*it));
+                    it = jobs.erase(it);
+                }
+                else
+                    ++it;
+            }
+        }
+        for (auto& job : removed)
+            if (job.cancelled)
+                job.cancelled();
+        return keys;
+    }
+
+    bool cancelled() const
+    {
+        return threadShouldExit() || !lifetime->alive.load()
+            || runningGeneration != lifetime->generation.load();
+    }
+
+    bool delay(int milliseconds)
+    {
+        const double until = juce::Time::getMillisecondCounterHiRes() + milliseconds;
+        while (!cancelled() && juce::Time::getMillisecondCounterHiRes() < until)
+            wait(100);
+        return !cancelled();
+    }
+
+    struct Response
+    {
+        int status = 0;
+        juce::StringPairArray headers;
+        juce::String body;
+    };
+#if defined(LOOPBRIDGE_GMAIL_TESTS)
+    std::function<Response(const juce::URL&)> testRequest;
+#endif
+
+    Response request(const juce::URL& url, const juce::String& headers,
+                     const juce::String& command)
+    {
+        Response response;
+        if (cancelled())
+            return response;
+#if defined(LOOPBRIDGE_GMAIL_TESTS)
+        if (testRequest)
+            return testRequest(url);
+#endif
+        juce::WebInputStream stream(url, false);
+        stream.withExtraHeaders(headers).withCustomRequestCommand(command)
+            .withConnectionTimeout(15000);
+        {
+            const juce::ScopedLock lock(streamLock);
+            if (cancelled())
+                return response;
+            activeStream = &stream;
+        }
+        if (stream.connect(nullptr))
+        {
+            response.status = stream.getStatusCode();
+            response.headers = stream.getResponseHeaders();
+            juce::MemoryOutputStream body;
+            char buffer[16384];
+            while (!cancelled() && !stream.isExhausted())
+            {
+                const int count = stream.read(buffer, sizeof(buffer));
+                if (count <= 0)
+                    break;
+                body.write(buffer, static_cast<size_t>(count));
+            }
+            response.body = body.toUTF8();
+            if (stream.isError())
+                response.status = 0;
+        }
+        {
+            const juce::ScopedLock lock(streamLock);
+            activeStream = nullptr;
+        }
+        return response;
+    }
+
+    void run() override
+    {
+        while (!threadShouldExit())
+        {
+            Job job;
+            bool found = false;
+            {
+                const juce::ScopedLock lock(queueLock);
+                jobs.erase(std::remove_if(jobs.begin(), jobs.end(), [this](const Job& queued)
+                    { return queued.generation != lifetime->generation.load(); }), jobs.end());
+                if (!jobs.empty())
+                {
+                    auto next = std::min_element(jobs.begin(), jobs.end(),
+                        [](const Job& a, const Job& b) { return a.priority < b.priority; });
+                    job = std::move(*next);
+                    jobs.erase(next);
+                    runningGeneration = job.generation;
+                    found = true;
+                }
+            }
+            if (found && !cancelled())
+            {
+                lastError = {};
+                job.run(*this);
+            }
+            else
+                wait(100);
+        }
+    }
+
+    // A library scan is many HTTP requests. Let explicit attachment work run
+    // between messages rather than holding the worker for the entire scan.
+    void runUrgentAttachments()
+    {
+        while (!cancelled())
+        {
+            Job job;
+            {
+                const juce::ScopedLock lock(queueLock);
+                auto next = std::min_element(jobs.begin(), jobs.end(),
+                    [](const Job& a, const Job& b) { return a.priority < b.priority; });
+                if (next == jobs.end() || next->key.isEmpty()
+                    || next->priority == GmailClient::Priority::prefetch
+                    || next->generation != runningGeneration)
+                    return;
+                job = std::move(*next);
+                jobs.erase(next);
+            }
+            const auto savedError = lastError;
+            lastError = {};
+            job.run(*this);
+            lastError = savedError;
+        }
+    }
+
+    // Accessed only by this worker; shared by listing and attachment requests.
+    double cooldownUntil = 0.0;
+    RequestError lastError, quotaError;
+
+private:
+    std::shared_ptr<Lifetime> lifetime;
+    uint64_t runningGeneration = 0;
+    juce::CriticalSection queueLock, streamLock;
+    std::vector<Job> jobs;
+    juce::WebInputStream* activeStream = nullptr;
+};
+
 class GmailAuthThread final
     : public juce::Thread
 {
@@ -402,7 +625,10 @@ public:
         : juce::Thread(
               "LoopBridge Gmail OAuth"),
           owner(ownerIn),
-          port(portIn)
+          port(portIn),
+          expectedState(ownerIn.stateToken),
+          lifetime(ownerIn.lifetime),
+          generation(ownerIn.getSessionGeneration())
     {
     }
 
@@ -482,27 +708,19 @@ public:
             return;
         }
 
-        fd_set readSet;
-
-        FD_ZERO(
-            &readSet);
-
-        FD_SET(
-            serverSocket,
-            &readSet);
-
-        timeval timeout {};
-
-        timeout.tv_sec = 180;
-        timeout.tv_usec = 0;
-
-        const int ready =
-            select(
-                0,
-                &readSet,
-                nullptr,
-                nullptr,
-                &timeout);
+        int ready = 0;
+        const double deadline = juce::Time::getMillisecondCounterHiRes() + 180000.0;
+        while (!threadShouldExit() && juce::Time::getMillisecondCounterHiRes() < deadline)
+        {
+            fd_set readSet;
+            FD_ZERO(&readSet);
+            FD_SET(serverSocket, &readSet);
+            timeval timeout {};
+            timeout.tv_usec = 100000;
+            ready = select(0, &readSet, nullptr, nullptr, &timeout);
+            if (ready != 0)
+                break;
+        }
 
         if (ready <= 0)
         {
@@ -534,9 +752,15 @@ public:
             return;
         }
 
+        const DWORD socketTimeout = 1000;
+        setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO,
+            reinterpret_cast<const char*>(&socketTimeout), sizeof(socketTimeout));
+        setsockopt(clientSocket, SOL_SOCKET, SO_SNDTIMEO,
+            reinterpret_cast<const char*>(&socketTimeout), sizeof(socketTimeout));
+
         const auto request =
             readHttpRequest(
-                clientSocket);
+                clientSocket, *this);
 
         const auto code =
             getQueryParameter(
@@ -557,7 +781,7 @@ public:
             error.isEmpty()
             && code.isNotEmpty()
             && returnedState
-                == owner.stateToken;
+                == expectedState;
 
         std::string body;
 
@@ -622,7 +846,7 @@ public:
         }
 
         if (returnedState
-            != owner.stateToken)
+            != expectedState)
         {
             finishWithError(
                 "OAuth state validation "
@@ -641,11 +865,10 @@ public:
         }
 
         juce::MessageManager::callAsync(
-            [this, code]
+            [client = &owner, state = lifetime, session = generation, code]
             {
-                owner
-                    .handleAuthorizationCode(
-                        code);
+                if (state->alive.load() && state->generation.load() == session)
+                    client->handleAuthorizationCode(code);
             });
 #else
         finishWithError(
@@ -660,32 +883,43 @@ private:
         const juce::String& message)
     {
         juce::MessageManager::callAsync(
-            [this, message]
+            [client = &owner, state = lifetime, session = generation, message]
             {
-                owner.setState(
-                    GmailClient::State::error,
-                    message);
+                if (state->alive.load() && state->generation.load() == session)
+                    client->setState(GmailClient::State::error, message);
             });
     }
 
     GmailClient& owner;
 
     int port = 0;
+    const juce::String expectedState;
+    std::shared_ptr<GmailClient::Lifetime> lifetime;
+    const uint64_t generation;
 };
 
-GmailClient::GmailClient() =
-    default;
+GmailClient::GmailClient() : worker(std::make_unique<Worker>(lifetime)) {}
 
 GmailClient::~GmailClient()
 {
+    shutdown();
+}
+
+void GmailClient::shutdown()
+{
+    lifetime->alive.store(false);
+    ++lifetime->generation;
+    pendingAttachments.clear();
     if (authThread != nullptr)
     {
         authThread
             ->signalThreadShouldExit();
 
         authThread
-            ->stopThread(2000);
+            ->stopThread(-1);
+        authThread.reset();
     }
+    worker.reset();
 }
 
 void GmailClient::connect(
@@ -699,6 +933,11 @@ void GmailClient::connect(
     {
         return;
     }
+    ++lifetime->generation;
+    pendingAttachments.clear();
+    worker->notify();
+    accessToken.clear();
+    refreshToken.clear();
 
     if (!loadCredentials(
             credentials))
@@ -716,13 +955,16 @@ void GmailClient::connect(
 
 void GmailClient::disconnect()
 {
+    ++lifetime->generation;
+    pendingAttachments.clear();
+    worker->notify();
     if (authThread != nullptr)
     {
         authThread
             ->signalThreadShouldExit();
 
         authThread
-            ->stopThread(1000);
+            ->stopThread(-1);
 
         authThread.reset();
     }
@@ -891,7 +1133,7 @@ void GmailClient::beginAuthorization()
     if (authThread != nullptr)
     {
         authThread
-            ->stopThread(1000);
+            ->stopThread(-1);
 
         authThread.reset();
     }
@@ -946,46 +1188,35 @@ void GmailClient::
         State::authorizing,
         "Finishing Google sign-in...");
 
-    TokenData tokens;
-
-    if (!exchangeCodeForTokens(
-            code,
-            tokens))
-    {
-        setState(
-            State::error,
-            "Could not exchange "
-            "authorization code for "
-            "Google tokens.");
-
-        return;
-    }
-
-    if (tokens.accessToken.isEmpty())
-    {
-        setState(
-            State::error,
-            "Google returned an empty "
-            "access token.");
-
-        return;
-    }
-
-    accessToken =
-        tokens.accessToken;
-
-    refreshToken =
-        tokens.refreshToken;
-
-    setState(
-        State::connected,
-        "Connected to Gmail");
+    const auto session = getSessionGeneration();
+    worker->enqueue({ {}, Priority::preview, session,
+        [this, guard = lifetime, session, code, auth = credentials,
+         verifier = codeVerifier, redirect = redirectUri](Worker& background)
+        {
+            TokenData tokens;
+            const bool success = exchangeCodeForTokens(code, tokens, auth, verifier, redirect, background);
+            juce::MessageManager::callAsync([this, guard, session, tokens, success]
+            {
+                if (!guard->alive.load() || guard->generation.load() != session)
+                    return;
+                if (!success)
+                {
+                    setState(State::error, "Could not exchange Google authorization code for tokens.");
+                    return;
+                }
+                accessToken = tokens.accessToken;
+                refreshToken = tokens.refreshToken;
+                setState(State::connected, "Connected to Gmail");
+            });
+        }, {} });
 }
 
 bool GmailClient::
     exchangeCodeForTokens(
         const juce::String& code,
-        TokenData& tokens)
+        TokenData& tokens, const OAuthCredentials& credentials,
+        const juce::String& codeVerifier, const juce::String& redirectUri,
+        Worker& worker)
 {
     juce::String body;
 
@@ -1023,37 +1254,14 @@ bool GmailClient::
         url.withPOSTData(
             body);
 
-    const auto options =
-        juce::URL::InputStreamOptions(
-            juce::URL::
-                ParameterHandling::
-                    inAddress)
-            .withHttpRequestCmd(
-                "POST")
-            .withExtraHeaders(
-                "Content-Type: "
-                "application/"
-                "x-www-form-urlencoded"
-                "\r\n")
-            .withConnectionTimeoutMs(
-                15000);
-
-    auto stream =
-        url.createInputStream(
-            options);
-
-    if (stream == nullptr)
-    {
+    const auto response = worker.request(url,
+        "Content-Type: application/x-www-form-urlencoded\r\n", "POST");
+    if (response.status < 200 || response.status >= 300 || worker.cancelled())
         return false;
-    }
-
-    const auto response =
-        stream
-            ->readEntireStreamAsString();
 
     const auto json =
         juce::JSON::parse(
-            response);
+            response.body);
 
     if (!json.isObject())
     {
@@ -1094,7 +1302,7 @@ bool GmailClient::
 bool GmailClient::performAuthorizedGet(
     const juce::String& requestUrl,
     juce::var& jsonResult,
-    juce::String& errorMessage) const
+    juce::String& errorMessage, const juce::String& accessToken, Worker& worker)
 {
     if (accessToken.isEmpty())
     {
@@ -1104,71 +1312,80 @@ bool GmailClient::performAuthorizedGet(
         return false;
     }
 
-    const auto options =
-        juce::URL::InputStreamOptions(
-            juce::URL::
-                ParameterHandling::
-                    inAddress)
-            .withHttpRequestCmd(
-                "GET")
-            .withExtraHeaders(
-                "Authorization: Bearer "
-                + accessToken
-                + "\r\n")
-            .withConnectionTimeoutMs(
-                15000);
-
-    auto stream =
-        juce::URL(
-            requestUrl)
-            .createInputStream(
-                options);
-
-    if (stream == nullptr)
+    if (juce::Time::getMillisecondCounterHiRes() < worker.cooldownUntil)
     {
-        errorMessage =
-            "Could not connect to Gmail API.";
-
+        worker.lastError = worker.quotaError;
+        errorMessage = "Gmail quota cooldown is active. " + worker.quotaError.message;
         return false;
     }
 
-    const auto response =
-        stream
-            ->readEntireStreamAsString();
-
-    jsonResult =
-        juce::JSON::parse(
-            response);
-
-    if (!jsonResult.isObject())
+    for (int attempt = 0; attempt < 3 && !worker.cancelled(); ++attempt)
     {
-        errorMessage =
-            "Gmail API returned invalid JSON.";
-
-        return false;
-    }
-
-    if (auto* object =
-            jsonResult.getDynamicObject())
-    {
-        const auto apiError =
-            object->getProperty(
-                "error");
-
-        if (!apiError.isVoid()
-            && !apiError.isUndefined())
+        const auto response = worker.request(juce::URL(requestUrl),
+            "Authorization: Bearer " + accessToken + "\r\n", "GET");
+        jsonResult = juce::JSON::parse(response.body);
+        const auto apiError = jsonResult["error"];
+        if (response.status >= 200 && response.status < 300
+            && jsonResult.isObject() && apiError.isVoid())
         {
-            errorMessage =
-                "Gmail API returned an error: "
-                + juce::JSON::toString(
-                    apiError,
-                    true);
-
-            return false;
+            worker.lastError = {};
+            return true;
         }
-    }
 
-    return true;
+        RequestError error;
+        error.httpStatus = response.status;
+        error.details = apiError;
+        if (const auto* reasons = apiError["errors"].getArray())
+            for (const auto& reason : *reasons)
+            {
+                const auto name = reason["reason"].toString();
+                if (error.reason.isNotEmpty())
+                    error.reason += ",";
+                error.reason += name;
+            }
+        if (const auto* details = apiError["details"].getArray())
+            for (const auto& detail : *details)
+            {
+                const auto reason = detail["reason"].toString();
+                if (reason.isNotEmpty())
+                    error.reason += (error.reason.isEmpty() ? "" : ",") + reason;
+            }
+        if (error.reason.isEmpty())
+            error.reason = apiError["status"].toString();
+        const bool rateLimited = response.status == 429
+            || error.reason.contains("userRateLimitExceeded")
+            || error.reason.contains("rateLimitExceeded");
+        const bool quotaLimited = rateLimited || error.reason.contains("dailyLimitExceeded")
+            || error.reason.contains("quotaExceeded")
+            || error.reason.contains("QUOTA_EXCEEDED")
+            || error.reason.contains("RESOURCE_EXHAUSTED")
+            || apiError["message"].toString().containsIgnoreCase("Total Query Cost");
+        const bool retryable = rateLimited || response.status == 0
+            || response.status == 500 || response.status == 502
+            || response.status == 503 || response.status == 504;
+        error.message = "HTTP " + juce::String(error.httpStatus)
+            + (error.reason.isEmpty() ? juce::String{} : " (" + error.reason + ")")
+            + ": " + (apiError.isObject() ? juce::JSON::toString(error.details, true)
+                : response.status == 0 ? juce::String("Could not connect to Gmail API.")
+                                      : juce::String("Gmail returned an invalid response."));
+        errorMessage = error.message;
+        worker.lastError = error;
+
+        int delayMs = (1000 << attempt) + juce::Random::getSystemRandom().nextInt(500);
+        const int retryAfter = response.headers.getValue("Retry-After", "0").getIntValue();
+        if (retryAfter > 0)
+            delayMs = juce::jmax(delayMs, juce::jmin(retryAfter, 300) * 1000);
+        if (quotaLimited)
+        {
+            worker.quotaError = error;
+            worker.cooldownUntil = juce::Time::getMillisecondCounterHiRes()
+                + (attempt == 2 || !retryable ? juce::jmax(60000, delayMs) : delayMs);
+        }
+        if (!retryable || attempt == 2 || delayMs > 10000 || !worker.delay(delayMs))
+            return false;
+    }
+    errorMessage = "Gmail request cancelled.";
+    return false;
 }
 
 juce::String
@@ -1333,14 +1550,46 @@ void GmailClient::
         int maxMessages,
         AudioListCallback callback)
 {
+    jassert(juce::MessageManager::getInstance()->isThisTheMessageThread());
+    if (!callback)
+        return;
+    if (state != State::connected || accessToken.isEmpty())
+    {
+        callback({}, "Gmail is not connected.");
+        return;
+    }
+    const auto session = getSessionGeneration();
+    worker->enqueue({ {}, Priority::download, session,
+        [this, guard = lifetime, session, token = accessToken, maxMessages,
+         callback = std::move(callback)](Worker& background)
+        {
+            fetchRecentAudioAttachmentsSync(maxMessages,
+                [this, guard, session, callback, &background](const std::vector<AudioAttachment>& files,
+                                           const juce::String& error)
+                {
+                    juce::MessageManager::callAsync([this, guard, session, callback, files, error,
+                                                    details = background.lastError]
+                    {
+                        if (guard->alive.load() && guard->generation.load() == session)
+                        {
+                            lastRequestError = details;
+                            callback(files, error);
+                        }
+                    });
+                }, token, background);
+        }, {} });
+}
+
+void GmailClient::fetchRecentAudioAttachmentsSync(
+    int maxMessages, AudioListCallback callback,
+    const juce::String& accessToken, Worker& worker)
+{
     if (!callback)
     {
         return;
     }
 
-    if (state
-            != State::connected
-        || accessToken.isEmpty())
+    if (accessToken.isEmpty())
     {
         callback(
             {},
@@ -1371,7 +1620,7 @@ void GmailClient::
     if (!performAuthorizedGet(
             listUrl,
             listJson,
-            error))
+            error, accessToken, worker))
     {
         callback(
             {},
@@ -1413,6 +1662,7 @@ void GmailClient::
     for (const auto& message
          : *messages.getArray())
     {
+        worker.runUrgentAttachments();
         auto* messageRef =
             message
                 .getDynamicObject();
@@ -1446,7 +1696,7 @@ void GmailClient::
         if (!performAuthorizedGet(
                 messageUrl,
                 messageJson,
-                error))
+                error, accessToken, worker))
         {
             callback(
                 {},
@@ -1512,16 +1762,121 @@ void GmailClient::
         const juce::String& attachmentId,
         const juce::String& filename,
         const juce::File& destinationDirectory,
-        DownloadCallback callback) const
+        DownloadCallback callback, Priority priority, const juce::File& localFile)
+{
+    jassert(juce::MessageManager::getInstance()->isThisTheMessageThread());
+    if (!callback)
+        return;
+    // Local cache reads are cheap and must not wait behind a running HTTP request.
+    const auto diskFile = getAttachmentCacheFile(messageId, attachmentId, filename, destinationDirectory);
+    const auto available = localFile.existsAsFile() && localFile.getSize() > 0 ? localFile : diskFile;
+    if (available.existsAsFile() && available.getSize() > 0)
+    {
+        lastRequestError = {};
+        callback(available, {});
+        return;
+    }
+    const auto key = messageId + "|" + attachmentId;
+    const auto pending = pendingAttachments.find(key);
+    if (pending != pendingAttachments.end())
+    {
+        pending->second->callbacks.push_back(std::move(callback));
+        worker->promote(key, priority);
+        return;
+    }
+    auto request = std::make_shared<PendingAttachment>();
+    request->callbacks.push_back(std::move(callback));
+    pendingAttachments[key] = request;
+    const auto session = getSessionGeneration();
+    const auto complete = [this, guard = lifetime, session, key, request](
+        const juce::File& file, const juce::String& error, const RequestError& details = {})
+    {
+        juce::MessageManager::callAsync([this, guard, session, key, request, file, error, details]
+        {
+            if (!guard->alive.load() || guard->generation.load() != session)
+                return;
+            const auto current = pendingAttachments.find(key);
+            if (current == pendingAttachments.end() || current->second != request)
+                return;
+            pendingAttachments.erase(current);
+            lastRequestError = details;
+            for (const auto& consumer : request->callbacks)
+            {
+                if (!guard->alive.load() || guard->generation.load() != session)
+                    break;
+                consumer(file, error);
+            }
+        });
+    };
+    worker->enqueue({ key, priority, session,
+        [token = state == State::connected ? accessToken : juce::String{},
+         messageId, attachmentId, filename, destinationDirectory,
+         localFile, complete](Worker& background)
+        {
+            const auto diskFile = getAttachmentCacheFile(messageId, attachmentId, filename,
+                                                         destinationDirectory);
+            if (localFile.existsAsFile() && localFile.getSize() > 0)
+                complete(localFile, {});
+            else if (diskFile.existsAsFile() && diskFile.getSize() > 0)
+                complete(diskFile, {});
+            else
+                downloadAudioAttachmentSync(messageId, attachmentId, filename,
+                    destinationDirectory,
+                    [complete, &background](const juce::File& file, const juce::String& error)
+                        { complete(file, error, background.lastError); }, token, background);
+        }, [complete] { complete({}, "Gmail prefetch cancelled."); } });
+}
+
+void GmailClient::discardQueuedNavigation(const juce::String& keepKey)
+{
+    for (const auto& key : worker->discardNavigation(keepKey))
+        pendingAttachments.erase(key);
+}
+
+void GmailClient::saveAttachment(const juce::File& file, const juce::File& directory,
+                                 DownloadCallback callback)
+{
+    const auto session = getSessionGeneration();
+    worker->enqueue({ {}, Priority::download, session,
+        [guard = lifetime, session, file, directory, callback](Worker& background)
+        {
+            const auto target = directory.getChildFile(file.getFileName());
+            // Browser/drag discovery scans this directory for files. Keep the
+            // unfinished copy in a subdirectory until it is ready to publish.
+            const auto staging = directory.getChildFile(".pending");
+            juce::TemporaryFile temporary(target, staging.getChildFile(juce::Uuid().toString()));
+            const bool saved = !background.cancelled() && staging.createDirectory().wasOk()
+                && file.copyFileTo(temporary.getFile())
+                && temporary.overwriteTargetFileWithTemporary();
+            juce::MessageManager::callAsync([guard, session, callback, target, saved]
+            {
+                if (guard->alive.load() && guard->generation.load() == session)
+                    callback(saved ? target : juce::File{},
+                             saved ? juce::String{} : juce::String("Could not save file."));
+            });
+        }, {} });
+}
+
+juce::File GmailClient::getAttachmentCacheFile(
+    const juce::String& messageId, const juce::String& attachmentId,
+    const juce::String& filename, const juce::File& directory)
+{
+    const auto identity = messageId + "|" + attachmentId;
+    return directory.getChildFile(juce::SHA256(identity.toRawUTF8(),
+        identity.getNumBytesAsUTF8()).toHexString() + "_" + sanitiseFilename(filename));
+}
+
+void GmailClient::downloadAudioAttachmentSync(
+    const juce::String& messageId, const juce::String& attachmentId,
+    const juce::String& filename, const juce::File& destinationDirectory,
+    DownloadCallback callback, const juce::String& accessToken, Worker& worker)
 {
     if (!callback)
     {
         return;
     }
 
-    if (state
-            != State::connected
-        || accessToken.isEmpty())
+    if (accessToken.isEmpty())
     {
         callback(
             {},
@@ -1587,7 +1942,7 @@ void GmailClient::
     if (!performAuthorizedGet(
             requestUrl,
             json,
-            error))
+            error, accessToken, worker))
     {
         callback(
             {},
@@ -1649,27 +2004,14 @@ void GmailClient::
         return;
     }
 
-    const auto safeFilename =
-        sanitiseFilename(
-            filename);
-
-    const auto attachmentIdentity = messageId + "|" + attachmentId;
-    const auto attachmentPrefix = juce::SHA256(
-        attachmentIdentity.toRawUTF8(),
-        attachmentIdentity.getNumBytesAsUTF8()).toHexString();
-
-    auto outputFile =
-        directory.getChildFile(
-            attachmentPrefix
-            + "_"
-            + safeFilename);
-
-    outputFile.deleteFile();
+    const auto outputFile = getAttachmentCacheFile(messageId, attachmentId, filename, directory);
+    // Publish only complete files so interrupted writes cannot become cache hits.
+    juce::TemporaryFile temporary(outputFile);
 
     std::unique_ptr<
         juce::FileOutputStream>
         outputStream(
-            outputFile
+            temporary.getFile()
                 .createOutputStream());
 
     if (outputStream == nullptr)
@@ -1692,10 +2034,9 @@ void GmailClient::
     outputStream.reset();
 
     if (!writeSucceeded
-        || !outputFile.existsAsFile()
-        || outputFile.getSize() <= 0)
+        || temporary.getFile().getSize() <= 0
+        || !temporary.overwriteTargetFileWithTemporary())
     {
-        outputFile.deleteFile();
 
         callback(
             {},
@@ -1785,3 +2126,260 @@ GmailClient::base64UrlEncode(
 
     return result;
 }
+
+#if defined(LOOPBRIDGE_GMAIL_TESTS)
+int runGmailClientTests()
+{
+    using Worker = GmailClient::Worker;
+    using Priority = GmailClient::Priority;
+    std::atomic<int> failures { 0 };
+    const auto check = [&failures](bool success, const char* name)
+    {
+        if (!success)
+        {
+            ++failures;
+            std::cout << "FAIL: " << name << '\n';
+        }
+    };
+    const auto pumpUntil = [](const std::function<bool()>& complete)
+    {
+        const double deadline = juce::Time::getMillisecondCounterHiRes() + 8000.0;
+        while (!complete() && juce::Time::getMillisecondCounterHiRes() < deadline)
+            juce::MessageManager::getInstance()->runDispatchLoopUntil(10);
+        return complete();
+    };
+    const auto directory = juce::File::getSpecialLocation(juce::File::tempDirectory)
+        .getChildFile("LoopBridgeGmailTests-" + juce::Uuid().toString());
+    check(directory.createDirectory().wasOk(), "test directory");
+
+    {
+        auto lifetime = std::make_shared<GmailClient::Lifetime>();
+        juce::WaitableEvent started, release, finished;
+        std::vector<juce::String> order;
+        Worker worker(lifetime);
+        worker.enqueue({ {}, Priority::preview, 0, [&](Worker& background)
+        {
+            started.signal();
+            while (!background.cancelled() && !release.wait(10)) {}
+        }, {} });
+        check(started.wait(2000), "worker starts independently");
+        const auto add = [&](const char* key, Priority priority)
+        {
+            worker.enqueue({ key, priority, 0, [&, key](Worker&)
+            {
+                order.push_back(key);
+                if (order.size() == 3)
+                    finished.signal();
+            }, {} });
+        };
+        add("prefetch", Priority::prefetch);
+        add("download", Priority::download);
+        add("retained", Priority::prefetch);
+        worker.promote("retained", Priority::download);
+        worker.promote("retained", Priority::preview);
+        add("preview", Priority::prefetch);
+        worker.promote("preview", Priority::preview);
+        const auto discarded = worker.discardNavigation("preview");
+        check(discarded.size() == 1 && discarded.front() == "prefetch",
+              "discard speculation while retaining explicit downloads");
+        release.signal();
+        check(finished.wait(2000), "queued work finishes");
+        worker.signalThreadShouldExit();
+        worker.notify();
+        worker.stopThread(-1);
+        check(order == std::vector<juce::String>{ "preview", "download", "retained" },
+              "preview priority, download priority, and promotion");
+    }
+
+    {
+        juce::WaitableEvent started, release;
+        GmailClient client;
+        client.state = GmailClient::State::connected;
+        client.accessToken = "offline-test-token";
+        std::atomic<int> requests { 0 };
+        std::atomic<bool> offMessageThread { true };
+        client.worker->enqueue({ {}, Priority::preview, client.getSessionGeneration(),
+            [&](Worker& background)
+            {
+                started.signal();
+                while (!background.cancelled() && !release.wait(10)) {}
+            }, {} });
+        check(started.wait(2000), "acquisition worker gate");
+        client.worker->testRequest = [&](const juce::URL&)
+        {
+            ++requests;
+            if (juce::MessageManager::getInstance()->isThisTheMessageThread())
+                offMessageThread.store(false);
+            return Worker::Response { 200, {}, "{\"data\":\"dGVzdA\"}" };
+        };
+        int completed = 0;
+        const auto callback = [&](const juce::File& file, const juce::String& error)
+        {
+            check(juce::MessageManager::getInstance()->isThisTheMessageThread(), "message-thread callback");
+            check(error.isEmpty() && file.getSize() == 4, "decoded and published cache file");
+            ++completed;
+        };
+        client.downloadAudioAttachment("message", "first", "same.wav", directory, callback, Priority::prefetch);
+        client.downloadAudioAttachment("message", "first", "same.wav", directory, callback, Priority::download);
+        client.downloadAudioAttachment("message", "first", "same.wav", directory, callback, Priority::preview);
+        check(client.pendingAttachments.size() == 1, "one shared pending acquisition");
+        release.signal();
+        check(pumpUntil([&] { return completed == 3; }), "all acquisition consumers complete");
+        check(requests.load() == 1 && offMessageThread.load(), "one background HTTP request");
+        client.downloadAudioAttachment("message", "second", "same.wav", directory, callback);
+        check(pumpUntil([&] { return completed == 4; }), "second same-named attachment");
+        const auto first = GmailClient::getAttachmentCacheFile("message", "first", "same.wav", directory);
+        const auto second = GmailClient::getAttachmentCacheFile("message", "second", "same.wav", directory);
+        check(first != second && first.existsAsFile() && second.existsAsFile(), "unique attachment files");
+        client.downloadAudioAttachment("message", "first", "same.wav", directory, callback);
+        client.downloadAudioAttachment("other", "saved", "same.wav", directory, callback,
+                                       Priority::preview, first);
+        check(completed == 6 && requests.load() == 2, "disk and supplied permanent cache avoid HTTP");
+        bool saved = false;
+        client.saveAttachment(first, directory.getChildFile("saved"),
+            [&](const juce::File& file, const juce::String& error)
+            { saved = error.isEmpty() && file.getSize() == 4; });
+        check(pumpUntil([&] { return saved; }), "background permanent save");
+    }
+
+    {
+        juce::WaitableEvent started, release;
+        GmailClient client;
+        client.state = GmailClient::State::connected;
+        client.accessToken = "offline-test-token";
+        std::atomic<int> requests { 0 };
+        client.worker->enqueue({ {}, Priority::preview, client.getSessionGeneration(),
+            [&](Worker& background)
+            {
+                started.signal();
+                while (!background.cancelled() && !release.wait(10)) {}
+            }, {} });
+        check(started.wait(2000), "cancellation worker gate");
+        client.worker->testRequest = [&](const juce::URL&)
+        { ++requests; return Worker::Response { 200, {}, "{\"data\":\"dGVzdA\"}" }; };
+        int obsolete = 0, current = 0;
+        client.downloadAudioAttachment("cancel", "first", "same.wav", directory,
+            [&](const juce::File&, const juce::String&) { ++obsolete; }, Priority::prefetch);
+        client.discardQueuedNavigation();
+        client.downloadAudioAttachment("cancel", "first", "same.wav", directory,
+            [&](const juce::File&, const juce::String& error) { if (error.isEmpty()) ++current; });
+        release.signal();
+        check(pumpUntil([&] { return current == 1; }), "demand after cancelled prefetch succeeds");
+        check(obsolete == 0 && requests.load() == 1, "late cancellation cannot erase new demand");
+
+        juce::WaitableEvent running, finish;
+        client.worker->enqueue({ {}, Priority::preview, client.getSessionGeneration(),
+            [&](Worker& background)
+            {
+                running.signal();
+                while (!background.cancelled() && !finish.wait(10)) {}
+            }, {} });
+        check(running.wait(2000), "session worker gate");
+        client.downloadAudioAttachment("session", "old", "same.wav", directory,
+            [&](const juce::File&, const juce::String&) { ++obsolete; });
+        client.disconnect();
+        client.state = GmailClient::State::connected;
+        client.accessToken = "new-offline-token";
+        client.downloadAudioAttachment("session", "new", "same.wav", directory,
+            [&](const juce::File&, const juce::String& error) { if (error.isEmpty()) ++current; });
+        finish.signal();
+        check(pumpUntil([&] { return current == 2; }), "new session succeeds");
+        check(obsolete == 0, "old session callback suppressed");
+    }
+
+    {
+        juce::WaitableEvent started, release;
+        GmailClient client;
+        client.state = GmailClient::State::connected;
+        client.accessToken = "offline-test-token";
+        std::atomic<int> requests { 0 };
+        client.worker->testRequest = [&](const juce::URL&)
+        {
+            ++requests;
+            started.signal();
+            release.wait(2000);
+            return Worker::Response { 200, {}, "{\"data\":\"dGVzdA\"}" };
+        };
+        int oldCallbacks = 0, newCallbacks = 0;
+        client.downloadAudioAttachment("running", "attachment", "same.wav", directory,
+            [&](const juce::File&, const juce::String&) { ++oldCallbacks; });
+        check(started.wait(2000), "attachment transfer is running");
+        client.downloadAudioAttachment("running", "attachment", "same.wav", directory,
+            [&](const juce::File&, const juce::String&) { ++oldCallbacks; }, Priority::download);
+        check(client.pendingAttachments.size() == 1, "running transfer deduplicates additional consumers");
+        client.disconnect();
+        client.state = GmailClient::State::connected;
+        client.accessToken = "new-offline-token";
+        client.downloadAudioAttachment("running", "attachment", "same.wav", directory,
+            [&](const juce::File& file, const juce::String& error)
+            { if (error.isEmpty() && file.getSize() == 4) ++newCallbacks; });
+        release.signal();
+        check(pumpUntil([&] { return newCallbacks == 1; }), "new session reuses completed old-session cache");
+        check(oldCallbacks == 0 && requests.load() == 1,
+              "running transfer finishes caching without stale callbacks or duplicate HTTP");
+    }
+
+    {
+        auto lifetime = std::make_shared<GmailClient::Lifetime>();
+        juce::WaitableEvent started, release;
+        Worker worker(lifetime);
+        worker.enqueue({ {}, Priority::preview, 0, [&](Worker& background)
+        {
+            started.signal();
+            while (!background.cancelled() && !release.wait(10)) {}
+        }, {} });
+        check(started.wait(2000), "error worker gate");
+        int requests = 0;
+        worker.testRequest = [&](const juce::URL&)
+        {
+            ++requests;
+            return Worker::Response { 403, {},
+                "{\"error\":{\"errors\":[{\"reason\":\"domainPolicy\"}],\"message\":\"Forbidden\"}}" };
+        };
+        std::atomic<bool> done { false };
+        worker.enqueue({ {}, Priority::preview, 0, [&](Worker& background)
+        {
+            juce::var json;
+            juce::String error;
+            check(!GmailClient::performAuthorizedGet("https://offline.test", json, error, "test", background),
+                  "permission failure reported");
+            check(requests == 1 && background.lastError.httpStatus == 403
+                && background.lastError.reason == "domainPolicy", "403 permissions not retried; structured error retained");
+            worker.testRequest = [&](const juce::URL&)
+            {
+                ++requests;
+                return Worker::Response { 403, {},
+                    "{\"error\":{\"errors\":[{\"reason\":\"dailyLimitExceeded\"}],\"message\":\"Quota\"}}" };
+            };
+            GmailClient::performAuthorizedGet("https://offline.test", json, error, "test", background);
+            GmailClient::performAuthorizedGet("https://offline.test", json, error, "test", background);
+            check(requests == 2 && error.contains("cooldown"), "quota cooldown prevents subsequent HTTP");
+            background.cooldownUntil = 0;
+            int attempts = 0;
+            worker.testRequest = [&](const juce::URL&)
+            {
+                ++attempts;
+                return attempts < 3 ? Worker::Response { 503, {}, "{}" }
+                                    : Worker::Response { 200, {}, "{}" };
+            };
+            check(GmailClient::performAuthorizedGet("https://offline.test", json, error, "test", background)
+                && attempts == 3, "bounded backoff recovers retryable failure");
+            done.store(true);
+        }, {} });
+        release.signal();
+        check(pumpUntil([&] { return done.load(); }), "error handling completes");
+    }
+
+    {
+        int callbacks = 0;
+        auto client = std::make_unique<GmailClient>();
+        client->downloadAudioAttachment("shutdown", "missing", "same.wav", directory,
+            [&](const juce::File&, const juce::String&) { ++callbacks; });
+        client.reset();
+        juce::MessageManager::getInstance()->runDispatchLoopUntil(50);
+        check(callbacks == 0, "shutdown suppresses queued callbacks");
+    }
+    directory.deleteRecursively();
+    return failures.load();
+}
+#endif

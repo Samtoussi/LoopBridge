@@ -143,3 +143,17 @@ target_link_libraries(
     PRIVATE
         juce::juce_core
 )
+
+option(LOOPBRIDGE_BUILD_GMAIL_TESTS "Build offline Gmail worker tests" OFF)
+if(LOOPBRIDGE_BUILD_GMAIL_TESTS)
+    juce_add_console_app(LoopBridgeGmailTests PRODUCT_NAME "LoopBridge Gmail Tests")
+    juce_generate_juce_header(LoopBridgeGmailTests)
+    target_sources(LoopBridgeGmailTests PRIVATE Desktop/GmailClientTests.cpp Desktop/GmailClient.cpp)
+    target_compile_features(LoopBridgeGmailTests PRIVATE cxx_std_17)
+    target_compile_definitions(LoopBridgeGmailTests PRIVATE
+        LOOPBRIDGE_GMAIL_TESTS=1 JUCE_MODAL_LOOPS_PERMITTED=1 JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0)
+    target_link_libraries(LoopBridgeGmailTests PRIVATE juce::juce_events juce::juce_cryptography)
+    if(WIN32)
+        target_link_libraries(LoopBridgeGmailTests PRIVATE ws2_32)
+    endif()
+endif()
