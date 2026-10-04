@@ -101,6 +101,23 @@ private:
             addAndMakeVisible(
                 gmailButton);
 
+            volumeSlider.setRange(0.0, 100.0, 1.0);
+            volumeSlider.setValue(100.0, juce::dontSendNotification);
+            volumeSlider.setTextValueSuffix("%");
+            volumeSlider.setSliderStyle(juce::Slider::LinearHorizontal);
+            volumeSlider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 65, 24);
+            volumeSlider.setName("Preview volume");
+            volumeSlider.setTooltip("Preview volume");
+            volumeSlider.onValueChange = [this]
+            {
+                {
+                    const juce::ScopedLock lock(audioLock);
+                    previewVolume = static_cast<float>(volumeSlider.getValue() / 100.0);
+                }
+                sendPreviewState();
+            };
+            addAndMakeVisible(volumeSlider);
+
             playButton.setEnabled(false);
             stopButton.setEnabled(false);
 
@@ -113,13 +130,26 @@ private:
             playButton.onClick =
                 [this]
                 {
-                    startSoloPreview();
+                    if (bridgeEnabled)
+                    {
+                        hostPreviewEnabled = !hostPreviewEnabled;
+                        stopSoloPreview();
+                        sendPreviewState();
+                    }
+                    else
+                        startSoloPreview();
                 };
 
             stopButton.onClick =
                 [this]
                 {
-                    stopSoloPreview();
+                    if (bridgeEnabled)
+                    {
+                        hostPreviewEnabled = false;
+                        sendPreviewState();
+                    }
+                    else
+                        stopSoloPreview();
                 };
 
             bridgeButton.onClick =
@@ -127,6 +157,7 @@ private:
                 {
                     bridgeEnabled =
                         !bridgeEnabled;
+                    stopSoloPreview();
 
                     bridgeButton.setButtonText(
                         bridgeEnabled
@@ -134,6 +165,7 @@ private:
                             : "BRIDGE OFF");
 
                     sendBridgeState();
+                    sendPreviewState();
 
                     repaint();
                 };
@@ -145,6 +177,7 @@ private:
                         == GmailClient::State::connected)
                     {
                         gmailClient.disconnect();
+                        pendingPrefetchCentre = -1;
 
                         gmailButton.setButtonText(
                             "CONNECT GMAIL");
@@ -388,6 +421,10 @@ private:
 
             rebuildSoloBuffer();
 
+            const juce::ScopedLock lock(audioLock);
+            soloGain.reset(newSampleRate, 0.02);
+            soloGain.setCurrentAndTargetValue(previewVolume);
+
             repaint();
         }
 
@@ -472,6 +509,13 @@ private:
 
                 remaining -=
                     samplesToCopy;
+            }
+            soloGain.setTargetValue(previewVolume);
+            for (int sample = 0; sample < info.numSamples; ++sample)
+            {
+                const float gain = soloGain.getNextValue();
+                for (int channel = 0; channel < outputChannels; ++channel)
+                    info.buffer->getWritePointer(channel, info.startSample)[sample] *= gain;
             }
         }
 
@@ -953,7 +997,13 @@ private:
                         13.0f,
                         juce::Font::bold)));
 
-            if (stretching)
+            if (bridgeEnabled && !isHostConnected())
+            {
+                g.setColour(juce::Colours::orange);
+                g.drawFittedText("BRIDGE DISCONNECTED / WAITING FOR VST",
+                    0, 287, getWidth(), 22, juce::Justification::centred, 1);
+            }
+            else if (stretching)
             {
                 g.setColour(
                     juce::Colours::orange);
@@ -985,7 +1035,7 @@ private:
                     juce::Justification::centred,
                     1);
             }
-            else if (hostPreviewReady)
+            else if (bridgeEnabled)
             {
                 g.setColour(
                     bridgeEnabled
@@ -994,9 +1044,11 @@ private:
                               .withAlpha(0.55f));
 
                 g.drawFittedText(
-                    bridgeEnabled
-                        ? "HOST PREVIEW -> FL MIXER"
-                        : "BRIDGE DISCONNECTED",
+                    !isHostConnected() ? "BRIDGE DISCONNECTED / WAITING FOR VST"
+                        : !hostPreviewEnabled ? "HOST PREVIEW PAUSED"
+                        : !hostPreviewReady ? "WAITING FOR HOST PREVIEW"
+                        : !hostPlaying ? "WAITING FOR FL TRANSPORT"
+                        : "HOST PREVIEW -> FL MIXER",
                     0,
                     287,
                     getWidth(),
@@ -1178,6 +1230,7 @@ private:
                 510,
                 180,
                 40);
+            volumeSlider.setBounds(15, 460, 235, 40);
         }
 
     private:
@@ -1207,6 +1260,7 @@ private:
 
         struct HostPreviewBuildResult
         {
+            uint64_t sourceGeneration = 0;
             juce::AudioBuffer<float>
                 buffer;
 
@@ -1488,6 +1542,14 @@ private:
             const auto key =
                 getLoopCacheKey(item);
 
+            const auto downloaded = getDownloadedLoopFile(item);
+            if (downloaded.existsAsFile())
+            {
+                gmailLoopCache[key] = downloaded;
+                rememberLoopDuration(key, downloaded);
+                return;
+            }
+
             const auto cached =
                 gmailLoopCache.find(key);
 
@@ -1523,13 +1585,11 @@ private:
         void prefetchAroundLoop(
             int centreIndex)
         {
-            // Keep the immediate neighbours warm. This is intentionally
-            // conservative so arrow-key browsing feels instant without
-            // hammering the Gmail API or downloading the whole inbox.
-            prefetchLoop(centreIndex - 2);
-            prefetchLoop(centreIndex - 1);
-            prefetchLoop(centreIndex + 1);
-            prefetchLoop(centreIndex + 2);
+            // Wait for navigation to settle, then fetch one neighbour per
+            // timer turn so pending keyboard input can be handled between them.
+            pendingPrefetchCentre = centreIndex;
+            pendingPrefetchStep = 0;
+            prefetchRequestedMs = juce::Time::getMillisecondCounterHiRes();
         }
 
         void loadSelectedGmailLoop(
@@ -1576,17 +1636,25 @@ private:
 
                     loadedBrowserLoopIndex = requestedIndex;
 
-                    prefetchAroundLoop(requestedIndex);
-
                     if (autoPlay
                         && requestId == previewRequestId)
                     {
-                        startSoloPreview();
+                        startPreview();
                     }
+
+                    prefetchAroundLoop(requestedIndex);
 
                     grabKeyboardFocus();
                     repaint();
                 };
+
+            const auto downloaded = getDownloadedLoopFile(item);
+            if (downloaded.existsAsFile())
+            {
+                gmailLoopCache[cacheKey] = downloaded;
+                useFile(downloaded);
+                return;
+            }
 
             const auto cached =
                 gmailLoopCache.find(cacheKey);
@@ -1661,7 +1729,7 @@ private:
             if (loadedBrowserLoopIndex == selectedLoopIndex
                 && soloBuffer.getNumSamples() > 0)
             {
-                startSoloPreview();
+                startPreview();
                 return;
             }
 
@@ -1693,6 +1761,15 @@ private:
                 return;
             }
 
+            if (bridgeEnabled)
+            {
+                hostPreviewEnabled = !hostPreviewEnabled;
+                stopSoloPreview();
+                sendPreviewState();
+                repaint();
+                return;
+            }
+
             if (soloPlaying)
             {
                 pauseSoloPreview();
@@ -1714,6 +1791,16 @@ private:
         void selectLoop(
             int index)
         {
+            pendingPrefetchCentre = -1;
+            if (index != selectedLoopIndex)
+            {
+                ++sourceGeneration;
+                previewBuildPending = false;
+                stretching = previewBuildRunning;
+                hostPreviewReady = false;
+                sendPreviewState();
+            }
+
             if (loopItems.empty())
             {
                 selectedLoopIndex =
@@ -2022,7 +2109,9 @@ private:
 
                 const bool thisLoopPlaying =
                     itemIndex == loadedBrowserLoopIndex
-                    && soloPlaying;
+                    && (bridgeEnabled
+                        ? isHostConnected() && hostPreviewEnabled && hostPreviewReady && hostPlaying
+                        : soloPlaying);
 
                 g.setColour(
                     thisLoopPlaying
@@ -2290,6 +2379,7 @@ private:
                         return;
 
                     loadedBrowserLoopIndex = -1;
+                    pendingPrefetchCentre = -1;
                     ++previewRequestId;
 
                     loadAudioFile(
@@ -2302,6 +2392,10 @@ private:
             const juce::File& file,
             double bpm)
         {
+            ++sourceGeneration;
+            previewBuildPending = false;
+            hostPreviewReady = false;
+            sendPreviewState();
             std::unique_ptr<
                 juce::AudioFormatReader>
                 reader(
@@ -2538,6 +2632,7 @@ private:
 
             const double sourceTempo =
                 sourceBpm;
+            const auto buildSourceGeneration = sourceGeneration;
 
             previewBuildPending =
                 false;
@@ -2556,11 +2651,13 @@ private:
                         sourceRate,
                         sourceTempo,
                         targetBpm,
-                        targetSampleRate
+                        targetSampleRate,
+                        buildSourceGeneration
                     ]() mutable
                     {
                         HostPreviewBuildResult
                             result;
+                        result.sourceGeneration = buildSourceGeneration;
 
                         result.bpm =
                             targetBpm;
@@ -2740,7 +2837,8 @@ private:
             }
 
             const bool stillCurrent =
-                std::abs(
+                result.sourceGeneration == sourceGeneration
+                && std::abs(
                     result.bpm
                     - hostBpm)
                     <= 0.01
@@ -2769,7 +2867,9 @@ private:
                 stretching =
                     true;
             }
-            else if (!stillCurrent)
+            else if (!stillCurrent
+                     && (loadedBrowserLoopIndex < 0
+                         || loadedBrowserLoopIndex == selectedLoopIndex))
             {
                 scheduleHostPreviewBuild(
                     false);
@@ -2873,6 +2973,35 @@ private:
 
             hostPreviewReady =
                 true;
+            sendPreviewState();
+        }
+
+        bool isHostConnected() const
+        {
+            return haveHostState && juce::Time::getMillisecondCounterHiRes()
+                - hostStateReceivedMs < 2000.0;
+        }
+
+        void sendPreviewState()
+        {
+            for (const auto& message : {
+                     juce::String("PREVIEW:") + (hostPreviewEnabled && hostPreviewReady ? "1" : "0"),
+                     juce::String("GAIN:") + juce::String(previewVolume, 6) })
+                sendSocket.write("127.0.0.1", 49153, message.toRawUTF8(),
+                                 static_cast<int>(message.getNumBytesAsUTF8()));
+        }
+
+        void startPreview()
+        {
+            if (bridgeEnabled)
+            {
+                stopSoloPreview();
+                hostPreviewEnabled = true;
+                sendPreviewState();
+                repaint();
+            }
+            else
+                startSoloPreview();
         }
 
         void sendBridgeState()
@@ -2951,6 +3080,8 @@ private:
 
         void startSoloPreview()
         {
+            if (bridgeEnabled)
+                return;
             if (soloBuffer
                     .getNumSamples()
                 <= 0)
@@ -3033,6 +3164,7 @@ private:
             {
                 return;
             }
+            bool reconnecting = !isHostConnected();
 
             double newBpm =
                 hostBpm;
@@ -3055,6 +3187,12 @@ private:
 
             for (const auto& part : parts)
             {
+                if (part.startsWith("SESSION:"))
+                {
+                    const auto session = part.substring(8);
+                    reconnecting = reconnecting || session != hostSession;
+                    hostSession = session;
+                }
                 if (part.startsWith(
                         "BPM:"))
                 {
@@ -3179,6 +3317,14 @@ private:
 
             haveHostState =
                 true;
+            if (reconnecting)
+            {
+                sendBridgeState();
+                if (hostPreviewReady)
+                    sendLoadCommand(juce::File::getSpecialLocation(juce::File::tempDirectory)
+                        .getChildFile("LoopBridge").getChildFile("preview.wav"));
+                sendPreviewState();
+            }
 
             if (playbackStarted
                 || playbackJumped)
@@ -3193,6 +3339,7 @@ private:
                 && !previewBuildRunning;
 
             if (sourceMusicalSamples > 0
+                && (loadedBrowserLoopIndex < 0 || loadedBrowserLoopIndex == selectedLoopIndex)
                 && (bpmChanged
                     || sampleRateChanged
                     || needsInitialPreview))
@@ -3227,6 +3374,39 @@ private:
             }
 
             finishPreviewBuildIfReady();
+            if (juce::Time::getMillisecondCounterHiRes() - previewStateSentMs >= 500.0)
+            {
+                sendBridgeState();
+                sendPreviewState();
+                previewStateSentMs = juce::Time::getMillisecondCounterHiRes();
+            }
+            if (bridgeEnabled)
+            {
+                playButton.setButtonText(hostPreviewEnabled ? "Pause" : "Play");
+                playButton.setEnabled(sourceMusicalSamples > 0);
+                stopButton.setEnabled(hostPreviewEnabled && sourceMusicalSamples > 0);
+            }
+            else
+                playButton.setButtonText("Play");
+
+            if (pendingPrefetchCentre >= 0)
+            {
+                if (pendingPrefetchCentre != selectedLoopIndex
+                    || gmailClient.getState() != GmailClient::State::connected)
+                {
+                    pendingPrefetchCentre = -1;
+                }
+                else if (juce::Time::getMillisecondCounterHiRes()
+                             - prefetchRequestedMs >= 300.0)
+                {
+                    const int neighbour = pendingPrefetchCentre
+                        + (pendingPrefetchStep == 0 ? 1 : -1);
+                    if (++pendingPrefetchStep >= 2)
+                        pendingPrefetchCentre = -1;
+                    prefetchRequestedMs = juce::Time::getMillisecondCounterHiRes();
+                    prefetchLoop(neighbour);
+                }
+            }
 
             if (previewBuildPending
                 && !previewBuildRunning)
@@ -3293,6 +3473,14 @@ private:
 
         bool soloPlaying =
             false;
+
+        bool hostPreviewEnabled = true;
+        juce::String hostSession;
+        uint64_t sourceGeneration = 0;
+        float previewVolume = 1.0f;
+        juce::SmoothedValue<float> soloGain;
+        double previewStateSentMs = 0.0;
+        juce::Slider volumeSlider;
 
         double stretchedForHostBpm =
             0.0;
@@ -3385,6 +3573,10 @@ private:
 
         std::set<juce::String>
             gmailPrefetchInFlight;
+
+        int pendingPrefetchCentre = -1;
+        int pendingPrefetchStep = 0;
+        double prefetchRequestedMs = 0.0;
 
         std::set<juce::String>
             downloadsInFlight;

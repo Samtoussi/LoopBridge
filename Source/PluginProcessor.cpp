@@ -101,6 +101,9 @@ LoopBridgeAudioProcessor::prepareToPlay(
     int)
 {
     currentSampleRate = sampleRate;
+    smoothedPreviewGain.reset(sampleRate, 0.02);
+    smoothedPreviewGain.setCurrentAndTargetValue(
+        previewEnabled.load() ? previewGain.load() : 0.0f);
 }
 
 void
@@ -176,6 +179,9 @@ LoopBridgeAudioProcessor::processBlock(
     const auto preview =
         std::atomic_load(
             &previewData);
+
+    smoothedPreviewGain.setTargetValue(
+        previewEnabled.load() ? previewGain.load() : 0.0f);
 
     // ---------------------------------------------------------
     // LOOPBRIDGE AUDIO OUTPUT
@@ -254,6 +260,8 @@ LoopBridgeAudioProcessor::processBlock(
                         remaining,
                         available);
 
+                const float startGain = smoothedPreviewGain.getCurrentValue();
+                const float endGain = smoothedPreviewGain.skip(samplesToCopy);
                 for (int channel = 0;
                      channel < outputChannels;
                      ++channel)
@@ -263,13 +271,13 @@ LoopBridgeAudioProcessor::processBlock(
                             channel,
                             sourceChannels - 1);
 
-                    buffer.addFrom(
+                    buffer.addFromWithRamp(
                         channel,
                         destinationPosition,
-                        preview->buffer,
-                        sourceChannel,
-                        sourcePosition,
-                        samplesToCopy);
+                        preview->buffer.getReadPointer(sourceChannel, sourcePosition),
+                        samplesToCopy,
+                        startGain,
+                        endGain);
                 }
 
                 destinationPosition +=
@@ -329,7 +337,8 @@ LoopBridgeAudioProcessor::sendHostState(
         + ";SR:"
         + juce::String(
             currentSampleRate,
-            1);
+            1)
+        + ";SESSION:" + bridgeSessionId;
 
     sendSocket.write(
         "127.0.0.1",
@@ -369,6 +378,20 @@ void
 LoopBridgeAudioProcessor::handleDesktopMessage(
     const juce::String& message)
 {
+    if (message.startsWith("PREVIEW:"))
+    {
+        previewEnabled.store(message.substring(8).getIntValue() != 0);
+        return;
+    }
+
+    if (message.startsWith("GAIN:"))
+    {
+        const float gain = message.substring(5).getFloatValue();
+        if (std::isfinite(gain))
+            previewGain.store(juce::jlimit(0.0f, 1.0f, gain));
+        return;
+    }
+
     if (message.startsWith(
             "BRIDGE:"))
     {

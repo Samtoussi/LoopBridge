@@ -102,6 +102,11 @@ private:
     std::atomic<bool>
         bridgeEnabled { true };
 
+    std::atomic<bool> previewEnabled { true };
+    std::atomic<float> previewGain { 1.0f };
+    juce::SmoothedValue<float> smoothedPreviewGain;
+    const juce::String bridgeSessionId { juce::Uuid().toString() };
+
     double currentSampleRate = 0.0;
     double lastSendTimeMs = 0.0;
 

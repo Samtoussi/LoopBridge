@@ -1653,16 +1653,14 @@ void GmailClient::
         sanitiseFilename(
             filename);
 
-    const auto messagePrefix =
-        messageId.substring(
-            0,
-            juce::jmin(
-                12,
-                messageId.length()));
+    const auto attachmentIdentity = messageId + "|" + attachmentId;
+    const auto attachmentPrefix = juce::SHA256(
+        attachmentIdentity.toRawUTF8(),
+        attachmentIdentity.getNumBytesAsUTF8()).toHexString();
 
     auto outputFile =
         directory.getChildFile(
-            messagePrefix
+            attachmentPrefix
             + "_"
             + safeFilename);
 
