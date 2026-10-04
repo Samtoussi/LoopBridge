@@ -9,6 +9,10 @@ class MetadataParser
 public:
     static void parse(LoopItem& item);
 
+    static std::optional<MusicalKey> musicalKeyFromLabel(const juce::String& label);
+    static int previewSemitones(const std::optional<MusicalKey>& source,
+                               MusicalKey target, bool syncEnabled, int manual);
+
 private:
     static std::optional<double> parseBpm(
         const juce::String& text);

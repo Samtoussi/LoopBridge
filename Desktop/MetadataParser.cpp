@@ -26,6 +26,8 @@ void MetadataParser::parse(
             MetadataSource::provided;
     }
 
+    item.key.clear();
+    item.keySource = MetadataSource::unknown;
     const auto filenameKey =
         parseKey(item.filename);
 
@@ -47,6 +49,7 @@ void MetadataParser::parse(
                 MetadataSource::provided;
         }
     }
+    item.musicalKey = musicalKeyFromLabel(item.key);
 }
 
 std::optional<double>
@@ -190,7 +193,7 @@ MetadataParser::parseKey(
     const juce::String& text)
 {
     const std::string input =
-        text.toStdString();
+        text.replaceCharacter(0x266f, '#').replaceCharacter(0x266d, 'b').toStdString();
 
     // Supported examples:
     //
@@ -213,7 +216,7 @@ MetadataParser::parseKey(
     // random letters inside filenames don't become keys.
 
     static const std::regex keyPattern(
-        R"((?:^|[^A-Za-z])([A-Ga-g])([#b]?)[\s_-]*(major|minor|maj|min|m)(?=$|[^A-Za-z]))",
+        R"((?:^|[^A-Za-z])([A-Ga-g])[\s_-]*(#|b|sharp|flat)?[\s_-]*(major|minor|maj|min|m)(?=$|[^A-Za-z]))",
         std::regex_constants::icase);
 
     std::smatch match;
@@ -244,14 +247,15 @@ MetadataParser::normaliseKey(
     juce::String normalisedRoot =
         root.toUpperCase();
 
-    normalisedRoot +=
-        accidental;
+    const auto lowerAccidental = accidental.toLowerCase();
+    normalisedRoot += lowerAccidental == "sharp" ? "#"
+        : lowerAccidental == "flat" ? "b" : lowerAccidental;
 
     const auto lowerQuality =
         quality.toLowerCase();
 
     const bool minor =
-        lowerQuality == "m"
+        (quality == "m")
         || lowerQuality == "min"
         || lowerQuality == "minor";
 
@@ -259,4 +263,29 @@ MetadataParser::normaliseKey(
         + (minor
                ? " minor"
                : " major");
+}
+
+std::optional<MusicalKey> MetadataParser::musicalKeyFromLabel(const juce::String& label)
+{
+    if (label.isEmpty())
+        return std::nullopt;
+    const auto root = juce::String("C D EF G A B").indexOfChar(label[0]);
+    if (root < 0)
+        return std::nullopt;
+    int pitchClass = root;
+    if (label.length() > 1 && label[1] == '#') ++pitchClass;
+    if (label.length() > 1 && label[1] == 'b') --pitchClass;
+    return MusicalKey { (pitchClass + 12) % 12, label.endsWith("minor") };
+}
+
+int MetadataParser::previewSemitones(const std::optional<MusicalKey>& source,
+                                    MusicalKey target, bool syncEnabled, int manual)
+{
+    int automatic = 0;
+    if (syncEnabled && source && source->minor == target.minor)
+    {
+        automatic = (target.pitchClass - source->pitchClass + 12) % 12;
+        if (automatic > 6) automatic -= 12;
+    }
+    return juce::jlimit(-12, 12, automatic + manual);
 }

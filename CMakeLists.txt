@@ -69,6 +69,7 @@ target_sources(
         Desktop/LoopItem.h
         Desktop/MetadataParser.h
         Desktop/MetadataParser.cpp
+        Desktop/PreviewRenderer.h
 )
 
 target_compile_features(
@@ -143,6 +144,15 @@ target_link_libraries(
     PRIVATE
         juce::juce_core
 )
+
+juce_add_console_app(LoopBridgePreviewTests PRODUCT_NAME "LoopBridge Preview Tests")
+juce_generate_juce_header(LoopBridgePreviewTests)
+target_sources(LoopBridgePreviewTests PRIVATE Desktop/PreviewRendererTests.cpp Desktop/PreviewRenderer.h)
+target_compile_features(LoopBridgePreviewTests PRIVATE cxx_std_17)
+target_compile_definitions(LoopBridgePreviewTests PRIVATE JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0)
+target_include_directories(LoopBridgePreviewTests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/SignalsmithStretch/include)
+target_link_libraries(LoopBridgePreviewTests PRIVATE
+    juce::juce_audio_formats juce::juce_cryptography signalsmith-stretch)
 
 option(LOOPBRIDGE_BUILD_GMAIL_TESTS "Build offline Gmail worker tests" OFF)
 if(LOOPBRIDGE_BUILD_GMAIL_TESTS)

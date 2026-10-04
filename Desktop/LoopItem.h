@@ -11,6 +11,12 @@ enum class MetadataSource
     detected
 };
 
+struct MusicalKey
+{
+    int pitchClass = 0;
+    bool minor = false;
+};
+
 struct LoopItem
 {
     // Gmail identity
@@ -31,6 +37,7 @@ struct LoopItem
     // Musical metadata
     std::optional<double> bpm;
     juce::String key;
+    std::optional<MusicalKey> musicalKey;
 
     MetadataSource bpmSource =
         MetadataSource::unknown;

@@ -39,6 +39,18 @@ int main()
     const std::vector<TestCase> tests =
     {
         // --------------------------------------------------
+        // Explicit keys, accidental spellings and boundary guards.
+        { "loop Bbmaj.wav", std::nullopt, "Bb major" },
+        { "loop eb_min.wav", std::nullopt, "Eb minor" },
+        { juce::String::fromUTF8("loop C\xe2\x99\xaf minor.wav"), std::nullopt, "C# minor" },
+        { juce::String::fromUTF8("loop G\xe2\x99\xad major.wav"), std::nullopt, "Gb major" },
+        { "loop C sharp minor.wav", std::nullopt, "C# minor" },
+        { "loop D-flat-maj.wav", std::nullopt, "Db major" },
+        { "loop CM.wav", std::nullopt, "C major" },
+        { "loop cm.wav", std::nullopt, "C minor" },
+        { "loop F#.wav", std::nullopt, "" },
+        { "warm_chamber.wav", std::nullopt, "" },
+
         // Existing explicit-BPM cases
         // --------------------------------------------------
 
@@ -300,6 +312,37 @@ int main()
             << " | expected: C# minor"
             << "\n\n";
     }
+
+    const auto check = [&](bool ok, const char* name)
+    {
+        if (ok) ++passed; else ++failed;
+        std::cout << (ok ? "[PASS] " : "[FAIL] ") << name << "\n";
+    };
+    LoopItem priority;
+    priority.filename = "loop Db minor.wav";
+    priority.subject = "C major 120 BPM";
+    MetadataParser::parse(priority);
+    check(priority.key == "Db minor" && priority.musicalKey
+        && priority.musicalKey->pitchClass == 1 && priority.musicalKey->minor, "Filename priority and flat pitch class");
+    const auto c = MetadataParser::musicalKeyFromLabel("C major");
+    check(MetadataParser::previewSemitones(c, { 6, false }, true, 0) == 6, "Six-semitone tie is positive");
+    check(MetadataParser::previewSemitones(c, { 11, false }, true, 0) == -1, "Nearest downward interval");
+    check(MetadataParser::previewSemitones(c, { 2, true }, true, 3) == 3, "Mode mismatch keeps manual adjustment");
+    check(MetadataParser::previewSemitones(std::nullopt, { 2, false }, true, -4) == -4, "Unknown key keeps manual adjustment");
+    check(MetadataParser::previewSemitones(c, { 2, false }, false, 3) == 3, "Sync disabled keeps manual adjustment");
+    check(MetadataParser::previewSemitones(c, { 2, false }, true, 3) == 5, "Automatic and manual offsets add");
+    check(MetadataParser::previewSemitones(c, { 6, false }, true, 12) == 12, "Positive effective pitch limit");
+    check(MetadataParser::previewSemitones(c, { 7, false }, true, -12) == -12, "Negative effective pitch limit");
+    const int classes[] = { 0, 2, 4, 5, 7, 9, 11 };
+    int index = 0;
+    for (const auto* root : { "C", "D", "E", "F", "G", "A", "B" })
+    {
+        const auto key = MetadataParser::musicalKeyFromLabel(juce::String(root) + " major");
+        check(key && key->pitchClass == classes[index++], root);
+    }
+    const auto cs = MetadataParser::musicalKeyFromLabel("C# minor");
+    const auto db = MetadataParser::musicalKeyFromLabel("Db minor");
+    check(cs && db && cs->pitchClass == db->pitchClass, "Enharmonic equivalence");
 
     std::cout
         << "================================\n"

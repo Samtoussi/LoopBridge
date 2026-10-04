@@ -3,10 +3,12 @@
 #include "GmailClient.h"
 #include "LoopItem.h"
 #include "MetadataParser.h"
+#include "PreviewRenderer.h"
 
 #include <signalsmith-stretch/signalsmith-stretch.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <future>
@@ -117,6 +119,41 @@ private:
                 sendPreviewState();
             };
             addAndMakeVisible(volumeSlider);
+            juce::PropertiesFile::Options options;
+            options.applicationName = "LoopBridge";
+            options.filenameSuffix = ".settings";
+            options.osxLibrarySubFolder = "Application Support";
+            settings = std::make_unique<juce::PropertiesFile>(options);
+            projectKeyId = juce::jlimit(1, 24, settings->getIntValue("projectKey", 1));
+            const char* notes[] = { "C", "C#/Db", "D", "D#/Eb", "E", "F", "F#/Gb", "G", "G#/Ab", "A", "A#/Bb", "B" };
+            for (int mode = 0; mode < 2; ++mode)
+                for (int note = 0; note < 12; ++note)
+                    projectKeySelector.addItem(juce::String(notes[note]) + (mode ? " minor" : " major"), mode * 12 + note + 1);
+            projectKeySelector.setSelectedId(projectKeyId, juce::dontSendNotification);
+            projectKeySelector.setTooltip("Project key");
+            keySyncButton.setButtonText("Key Sync");
+            keySyncButton.setToggleState(settings->getBoolValue("keySync", false), juce::dontSendNotification);
+            pitchMinus.setButtonText("-");
+            pitchPlus.setButtonText("+");
+            pitchMinus.setWantsKeyboardFocus(false);
+            pitchPlus.setWantsKeyboardFocus(false);
+            keySyncButton.setWantsKeyboardFocus(false);
+            projectKeySelector.onChange = [this]
+            {
+                projectKeyId = projectKeySelector.getSelectedId();
+                keySettingsChanged(true);
+                grabKeyboardFocus();
+            };
+            keySyncButton.onClick = [this] { keySettingsChanged(true); grabKeyboardFocus(); };
+            pitchMinus.onClick = [this] { adjustManualPitch(-1); };
+            pitchPlus.onClick = [this] { adjustManualPitch(1); };
+            addAndMakeVisible(projectKeySelector);
+            addAndMakeVisible(keySyncButton);
+            addAndMakeVisible(pitchMinus);
+            addAndMakeVisible(pitchPlus);
+            addAndMakeVisible(pitchLabel);
+            addAndMakeVisible(keyStatusLabel);
+            updatePitchControls();
 
             playButton.setEnabled(false);
             stopButton.setEnabled(false);
@@ -145,8 +182,8 @@ private:
                         stopSoloPreview();
                         sendPreviewState();
                     }
-                    else
-                        startSoloPreview();
+                    else if (soloPreviewIntent) pauseSoloPreview();
+                    else startSoloPreview();
                 };
 
             stopButton.onClick =
@@ -174,6 +211,7 @@ private:
                             ? "BRIDGE ON"
                             : "BRIDGE OFF");
 
+                    rebuildSoloBuffer();
                     sendBridgeState();
                     sendPreviewState();
 
@@ -187,6 +225,11 @@ private:
                         == GmailClient::State::connected)
                     {
                         gmailClient.disconnect();
+                        ++sourceGeneration;
+                        nearbyRenders.clear();
+                        nearbyRenderCentre = -1;
+                        previewBuildPending = false;
+                        stretching = false;
                         pendingPrefetchCentre = -1;
                         cancelPendingBrowserPreview();
                         downloadsInFlight.clear();
@@ -428,6 +471,7 @@ private:
             }
 
             shutdownAudio();
+            preparedDirectory.deleteRecursively();
         }
 
         void prepareToPlay(
@@ -437,8 +481,11 @@ private:
             deviceSampleRate =
                 newSampleRate;
 
-            rebuildSoloBuffer();
-
+            const juce::Component::SafePointer<MainComponent> safeThis(this);
+            juce::MessageManager::callAsync([safeThis]
+            {
+                if (safeThis != nullptr) safeThis->rebuildSoloBuffer();
+            });
             const juce::ScopedLock lock(audioLock);
             soloGain.reset(newSampleRate, 0.02);
             soloGain.setCurrentAndTargetValue(previewVolume);
@@ -466,14 +513,14 @@ private:
             if (!soloPlaying)
                 return;
 
-            if (soloBuffer.getNumSamples() <= 0)
+            if (!soloBuffer || soloBuffer->getNumSamples() <= 0)
                 return;
 
             const int loopSamples =
-                soloBuffer.getNumSamples();
+                soloBuffer->getNumSamples();
 
             const int sourceChannels =
-                soloBuffer.getNumChannels();
+                soloBuffer->getNumChannels();
 
             const int outputChannels =
                 info.buffer->getNumChannels();
@@ -513,7 +560,7 @@ private:
                         channel,
                         info.startSample
                             + destinationOffset,
-                        soloBuffer,
+                        *soloBuffer,
                         sourceChannel,
                         soloPlaybackPosition,
                         samplesToCopy);
@@ -990,7 +1037,7 @@ private:
             const juce::String deviceSrText =
                 deviceSampleRate > 0.0
                     ? juce::String(
-                          deviceSampleRate,
+                          deviceSampleRate.load(),
                           0)
                           + " Hz"
                     : "--";
@@ -1021,13 +1068,18 @@ private:
                 g.drawFittedText("BRIDGE DISCONNECTED / WAITING FOR VST",
                     0, 287, getWidth(), 22, juce::Justification::centred, 1);
             }
+            else if (renderError.isNotEmpty())
+            {
+                g.setColour(juce::Colours::orange);
+                g.drawFittedText(renderError, 0, 287, getWidth(), 22, juce::Justification::centred, 1);
+            }
             else if (stretching)
             {
                 g.setColour(
                     juce::Colours::orange);
 
                 g.drawFittedText(
-                    "PREPARING NEW BPM...",
+                    "PREPARING PREVIEW...",
                     0,
                     287,
                     getWidth(),
@@ -1098,11 +1150,11 @@ private:
                 juce::Justification::centred,
                 1);
 
-            if (sourceBuffer.getNumSamples() > 0
+            if (sourceTotalSamples > 0
                 && sourceSampleRate > 0.0)
             {
                 const double fileSeconds =
-                    sourceBuffer.getNumSamples()
+                    sourceTotalSamples
                     / sourceSampleRate;
 
                 juce::String lengthText =
@@ -1132,16 +1184,13 @@ private:
                         " / Musical: BPM unknown";
                 }
 
-                if (hostPreviewBuffer
-                            .getNumSamples()
-                        > 0
+                if (hostPreviewBuffer && hostPreviewBuffer->getNumSamples() > 0
                     && stretchedForHostSampleRate
                            > 0.0)
                 {
                     const double
                         stretchedSeconds =
-                            hostPreviewBuffer
-                                .getNumSamples()
+                            hostPreviewBuffer->getNumSamples()
                             / stretchedForHostSampleRate;
 
                     lengthText +=
@@ -1249,6 +1298,12 @@ private:
                 180,
                 40);
             volumeSlider.setBounds(15, 460, 235, 40);
+            projectKeySelector.setBounds(35, 553, 175, 28);
+            keySyncButton.setBounds(225, 553, 95, 28);
+            pitchMinus.setBounds(345, 553, 28, 28);
+            pitchLabel.setBounds(377, 553, 95, 28);
+            pitchPlus.setBounds(476, 553, 28, 28);
+            keyStatusLabel.setBounds(525, 553, getWidth() - 550, 28);
         }
 
     private:
@@ -1276,16 +1331,11 @@ private:
         static constexpr int
             browserVisibleRows = 5;
 
-        struct HostPreviewBuildResult
+        using HostPreviewBuildResult = PreviewRenderer::Result;
+        struct CachedPreview
         {
-            uint64_t sourceGeneration = 0;
-            juce::AudioBuffer<float>
-                buffer;
-
-            double bpm = 0.0;
-            double sampleRate = 0.0;
-
-            bool success = false;
+            HostPreviewBuildResult result;
+            uint64_t lastUse = 0;
         };
 
         static void parseSender(
@@ -1555,7 +1605,14 @@ private:
                 loopItems[static_cast<size_t>(index)];
 
             acquireLoop(item, GmailClient::Priority::prefetch,
-                [](const juce::File&, const juce::String&) {});
+                [this](const juce::File& file, const juce::String& error)
+                {
+                    if (error.isEmpty() && file.existsAsFile())
+                    {
+                        nearbyRenderCentre = selectedLoopIndex;
+                        nearbyRenderRequestedMs = juce::Time::getMillisecondCounterHiRes();
+                    }
+                });
         }
 
         void prefetchAroundLoop(
@@ -1609,7 +1666,7 @@ private:
                         file,
                         item.bpm.has_value()
                             ? *item.bpm
-                            : 0.0);
+                            : 0.0, item.key, cacheKey);
 
                     loadedBrowserLoopIndex = requestedIndex;
 
@@ -1694,7 +1751,7 @@ private:
                 return;
 
             if (loadedBrowserLoopIndex == selectedLoopIndex
-                && soloBuffer.getNumSamples() > 0)
+                && sourceMusicalSamples > 0)
             {
                 startPreview();
                 return;
@@ -1708,6 +1765,7 @@ private:
             {
                 const juce::ScopedLock lock(audioLock);
                 soloPlaying = false;
+                soloPreviewIntent = false;
             }
 
             playButton.setEnabled(sourceMusicalSamples > 0);
@@ -1732,7 +1790,7 @@ private:
             }
 
             if (loadedBrowserLoopIndex != selectedLoopIndex
-                || soloBuffer.getNumSamples() <= 0)
+                || sourceMusicalSamples <= 0)
             {
                 previewSelectedLoop();
                 return;
@@ -1747,22 +1805,13 @@ private:
                 return;
             }
 
-            if (soloPlaying)
+            if (soloPreviewIntent)
             {
                 pauseSoloPreview();
                 return;
             }
 
-            {
-                const juce::ScopedLock lock(audioLock);
-                if (soloPlaybackPosition >= soloBuffer.getNumSamples())
-                    soloPlaybackPosition = 0;
-                soloPlaying = true;
-            }
-
-            playButton.setEnabled(false);
-            stopButton.setEnabled(true);
-            repaint();
+            startSoloPreview();
         }
 
         void selectLoop(
@@ -1775,8 +1824,14 @@ private:
                 gmailClient.discardQueuedNavigation(index >= 0 && index < static_cast<int>(loopItems.size())
                     ? getLoopCacheKey(loopItems[static_cast<size_t>(index)]) : juce::String{});
                 ++sourceGeneration;
+                manualSemitones = 0;
+                nearbyRenders.clear();
+                nearbyRenderCentre = -1;
                 previewBuildPending = false;
-                stretching = previewBuildRunning;
+                stretching = false;
+                soloPreviewReady = false;
+                appliedRenderKey.clear();
+                stopSoloPreview();
                 hostPreviewReady = false;
                 sendPreviewState();
             }
@@ -1803,6 +1858,7 @@ private:
 
             selectedLoopIndex =
                 index;
+            updatePitchControls();
 
             if (selectedLoopIndex
                 < browserScrollIndex)
@@ -2370,592 +2426,323 @@ private:
                 });
         }
 
-        void loadAudioFile(
-            const juce::File& file,
-            double bpm)
+        MusicalKey projectKey() const
+        {
+            return { (projectKeyId - 1) % 12, projectKeyId > 12 };
+        }
+
+        int effectivePitch(const std::optional<MusicalKey>& key, int manual) const
+        {
+            return MetadataParser::previewSemitones(key, projectKey(), keySyncButton.getToggleState(), manual);
+        }
+
+        void updatePitchControls()
+        {
+            auto key = sourceKey;
+            if ((loadedBrowserLoopIndex >= 0 || pendingBrowserPreview.isNotEmpty())
+                && selectedLoopIndex >= 0 && selectedLoopIndex < static_cast<int>(loopItems.size()))
+                key = loopItems[static_cast<size_t>(selectedLoopIndex)].musicalKey;
+            const int pitch = effectivePitch(key, manualSemitones);
+            pitchLabel.setText((pitch > 0 ? "+" : "") + juce::String(pitch) + " st", juce::dontSendNotification);
+            pitchLabel.setJustificationType(juce::Justification::centred);
+            pitchMinus.setEnabled(pitch > -12);
+            pitchPlus.setEnabled(pitch < 12);
+            keyStatusLabel.setText(!key ? "Source key unknown"
+                : keySyncButton.getToggleState() && key->minor != projectKey().minor
+                    ? "Mode mismatch: manual only" : "", juce::dontSendNotification);
+            keyStatusLabel.setColour(juce::Label::textColourId, juce::Colours::white.withAlpha(0.6f));
+            pitchLabel.setTooltip(!key ? "Unknown source key: manual pitch only"
+                : keySyncButton.getToggleState() && key->minor != projectKey().minor
+                    ? "Major/minor mismatch: manual pitch only" : "Effective preview pitch shift");
+        }
+
+        void adjustManualPitch(int direction)
+        {
+            auto key = sourceKey;
+            if ((loadedBrowserLoopIndex >= 0 || pendingBrowserPreview.isNotEmpty())
+                && selectedLoopIndex >= 0 && selectedLoopIndex < static_cast<int>(loopItems.size()))
+                key = loopItems[static_cast<size_t>(selectedLoopIndex)].musicalKey;
+            const int automatic = effectivePitch(key, 0);
+            manualSemitones = juce::jlimit(-12, 12, effectivePitch(key, manualSemitones) + direction) - automatic;
+            keySettingsChanged(false);
+            grabKeyboardFocus();
+        }
+
+        void keySettingsChanged(bool persist)
+        {
+            updatePitchControls();
+            if (persist)
+            {
+                settings->setValue("projectKey", projectKeyId);
+                settings->setValue("keySync", keySyncButton.getToggleState());
+            }
+            ++sourceGeneration;
+            nearbyRenders.clear();
+            nearbyRenderCentre = selectedLoopIndex;
+            nearbyRenderRequestedMs = juce::Time::getMillisecondCounterHiRes();
+            scheduleHostPreviewBuild(true);
+            repaint();
+        }
+
+        PreviewRenderer::Request makeRenderRequest(const juce::File& file,
+            const juce::String& identity, double bpm, int pitch) const
+        {
+            PreviewRenderer::Request request;
+            request.source = file;
+            request.generation = sourceGeneration;
+            request.sourceBpm = bpm;
+            request.host = bridgeEnabled;
+            request.bpm = request.host ? hostBpm : 0.0;
+            request.sampleRate = request.host ? hostSampleRate : deviceSampleRate.load();
+            request.semitones = pitch;
+            const auto descriptor = PreviewRenderer::cacheDescriptor(request, identity);
+            request.key = juce::SHA256(descriptor.toRawUTF8(), descriptor.getNumBytesAsUTF8()).toHexString();
+            request.hostFile = preparedDirectory.getChildFile(request.key + ".wav");
+            return request;
+        }
+
+        PreviewRenderer::Request currentRenderRequest() const
+        {
+            return makeRenderRequest(originalPreviewFile, originalPreviewIdentity,
+                sourceBpm, effectivePitch(sourceKey, manualSemitones));
+        }
+
+        bool hasCurrentSource() const
+        {
+            return sourceMusicalSamples > 0 && originalPreviewFile.existsAsFile()
+                && (loadedBrowserLoopIndex < 0
+                    || (loadedBrowserLoopIndex == selectedLoopIndex && selectedLoopIndex >= 0
+                        && selectedLoopIndex < static_cast<int>(loopItems.size())
+                        && originalPreviewIdentity == getLoopCacheKey(loopItems[static_cast<size_t>(selectedLoopIndex)])));
+        }
+
+        void loadAudioFile(const juce::File& file, double bpm,
+                           const juce::String& key = {}, const juce::String& identity = {})
         {
             ++sourceGeneration;
             previewBuildPending = false;
+            nearbyRenders.clear();
+            nearbyRenderCentre = -1;
             hostPreviewReady = false;
-            sendPreviewState();
-            std::unique_ptr<
-                juce::AudioFormatReader>
-                reader(
-                    formatManager
-                        .createReaderFor(
-                            file));
-
-            if (reader == nullptr)
-                return;
-
+            soloPreviewReady = false;
+            appliedRenderKey.clear();
+            renderError.clear();
             stopSoloPreview();
-
-            sourceBpm = bpm;
-
-            sourceSampleRate =
-                reader->sampleRate;
-
-            const int channels =
-                static_cast<int>(
-                    reader->numChannels);
-
-            const int64 totalSamples64 =
-                reader->lengthInSamples;
-
-            if (totalSamples64 <= 0
-                || totalSamples64
-                    > std::numeric_limits<int>::
-                          max())
-            {
+            sendPreviewState();
+            std::unique_ptr<juce::AudioFormatReader> reader(formatManager.createReaderFor(file));
+            sourceMusicalSamples = 0;
+            sourceTotalSamples = 0;
+            if (!reader || reader->sampleRate <= 0.0 || reader->lengthInSamples <= 0
+                || reader->lengthInSamples > std::numeric_limits<int>::max())
                 return;
-            }
-
-            const int totalSamples =
-                static_cast<int>(
-                    totalSamples64);
-
-            sourceBuffer.setSize(
-                channels,
-                totalSamples);
-
-            reader->read(
-                &sourceBuffer,
-                0,
-                totalSamples,
-                0,
-                true,
-                true);
-
-            if (sourceBpm > 0.0)
+            originalPreviewFile = file;
+            originalPreviewIdentity = identity.isNotEmpty() ? identity : file.getFullPathName();
+            sourceKey = MetadataParser::musicalKeyFromLabel(key);
+            if (identity.isEmpty())
             {
-                const double
-                    musicalDurationSeconds =
-                        loopBeats
-                        * 60.0
-                        / sourceBpm;
-
-                sourceMusicalSamples =
-                    std::min(
-                        sourceBuffer
-                            .getNumSamples(),
-                        static_cast<int>(
-                            std::llround(
-                                musicalDurationSeconds
-                                * sourceSampleRate)));
+                LoopItem local;
+                local.filename = file.getFileName();
+                MetadataParser::parse(local);
+                sourceKey = local.musicalKey;
+                manualSemitones = 0;
             }
-            else
-            {
-                sourceMusicalSamples =
-                    sourceBuffer.getNumSamples();
-            }
-
-            loadedFileName =
-                file.getFileName();
-
-            rebuildSoloBuffer();
-
-            hostPreviewReady =
-                false;
-
-            if (sourceBpm > 0.0
-                && hostBpm > 0.0
-                && hostSampleRate > 0.0)
-            {
-                scheduleHostPreviewBuild(
-                    true);
-            }
-
-            playButton.setEnabled(
-                sourceMusicalSamples > 0);
-
+            sourceBpm = bpm;
+            sourceSampleRate = reader->sampleRate;
+            sourceTotalSamples = static_cast<int>(reader->lengthInSamples);
+            sourceMusicalSamples = sourceBpm > 0.0 ? std::min(sourceTotalSamples,
+                static_cast<int>(std::llround(loopBeats * 60.0 / sourceBpm * sourceSampleRate))) : sourceTotalSamples;
+            loadedFileName = file.getFileName();
+            updatePitchControls();
+            // The browser callback installs its loaded index immediately after
+            // this returns. All decoding/rendering is deferred to the worker.
+            previewBuildPending = true;
+            previewBuildRequestedMs = juce::Time::getMillisecondCounterHiRes() - previewDebounceMs;
+            stretching = true;
+            playButton.setEnabled(sourceMusicalSamples > 0);
             repaint();
         }
 
         void rebuildSoloBuffer()
         {
-            if (sourceMusicalSamples <= 0
-                || sourceSampleRate <= 0.0
-                || deviceSampleRate <= 0.0)
-            {
-                return;
-            }
-
-            const int channels =
-                sourceBuffer
-                    .getNumChannels();
-
-            const int outputSamples =
-                std::max(
-                    1,
-                    static_cast<int>(
-                        std::llround(
-                            sourceMusicalSamples
-                            * deviceSampleRate
-                            / sourceSampleRate)));
-
-            juce::AudioBuffer<float>
-                newSoloBuffer;
-
-            newSoloBuffer.setSize(
-                channels,
-                outputSamples);
-
-            const double ratio =
-                sourceSampleRate
-                / deviceSampleRate;
-
-            for (int channel = 0;
-                 channel < channels;
-                 ++channel)
-            {
-                juce::LagrangeInterpolator
-                    interpolator;
-
-                interpolator.process(
-                    ratio,
-                    sourceBuffer
-                        .getReadPointer(
-                            channel),
-                    newSoloBuffer
-                        .getWritePointer(
-                            channel),
-                    outputSamples);
-            }
-
-            {
-                const juce::ScopedLock lock(
-                    audioLock);
-
-                soloBuffer =
-                    std::move(
-                        newSoloBuffer);
-
-                soloPlaybackPosition =
-                    0;
-            }
+            nearbyRenders.clear();
+            nearbyRenderCentre = selectedLoopIndex;
+            nearbyRenderRequestedMs = juce::Time::getMillisecondCounterHiRes();
+            scheduleHostPreviewBuild(true);
         }
 
-        void scheduleHostPreviewBuild(
-            bool immediate)
+        void applyPreparedPreview(const HostPreviewBuildResult& result)
         {
-            if (sourceMusicalSamples <= 0
-                || sourceSampleRate <= 0.0
-                || sourceBpm <= 0.0
-                || hostSampleRate <= 0.0
-                || hostBpm <= 0.0)
+            appliedRenderKey = result.request.key;
+            renderError.clear();
+            if (result.request.host)
             {
+                hostPreviewBuffer = result.buffer;
+                stretchedForHostBpm = result.request.bpm;
+                stretchedForHostSampleRate = result.request.sampleRate;
+                activeHostPreviewFile = result.request.hostFile;
+                sendLoadCommand(activeHostPreviewFile);
+                sendBridgeState();
+                if (haveHostState) sendRephaseCommand(hostPpq);
+                hostPreviewReady = true;
+                sendPreviewState();
+            }
+            else
+            {
+                const juce::ScopedLock lock(audioLock);
+                soloBuffer = result.buffer;
+                soloPlaybackPosition %= soloBuffer->getNumSamples();
+                soloPreviewReady = true;
+                soloPlaying = soloPreviewIntent && !bridgeEnabled;
+                soloGain.setCurrentAndTargetValue(0.0f);
+            }
+            stretching = false;
+            previewBuildPending = false;
+            nearbyRenderCentre = selectedLoopIndex;
+            nearbyRenderRequestedMs = juce::Time::getMillisecondCounterHiRes();
+            repaint();
+        }
+
+        void scheduleHostPreviewBuild(bool immediate)
+        {
+            if (!hasCurrentSource()) return;
+            const auto request = currentRenderRequest();
+            if (request.key == appliedRenderKey && (request.host ? hostPreviewReady : soloPreviewReady)) return;
+            // Never play the old pitch while preparing the new one. Intent is
+            // kept separately, so Pause during a render still wins.
+            hostPreviewReady = false;
+            soloPreviewReady = false;
+            {
+                const juce::ScopedLock lock(audioLock);
+                soloPlaying = false;
+            }
+            sendPreviewState();
+            nearbyRenders.clear();
+            renderError.clear();
+            if (request.sampleRate <= 0.0 || (request.host && (sourceBpm <= 0.0 || hostBpm <= 0.0)))
+            {
+                previewBuildPending = false;
+                stretching = false;
                 return;
             }
-
-            pendingPreviewBpm =
-                hostBpm;
-
-            pendingPreviewSampleRate =
-                hostSampleRate;
-
-            previewBuildRequestedMs =
-                juce::Time::
-                    getMillisecondCounterHiRes();
-
-            previewBuildPending =
-                true;
-
-            stretching =
-                true;
-
-            if (immediate
-                && !previewBuildRunning)
+            const auto cached = preparedPreviews.find(request.key);
+            if (cached != preparedPreviews.end())
             {
-                startPendingPreviewBuild();
+                cached->second.lastUse = ++previewCacheClock;
+                applyPreparedPreview(cached->second.result);
+                return;
             }
-
+            previewBuildPending = true;
+            previewBuildRequestedMs = juce::Time::getMillisecondCounterHiRes()
+                - (immediate ? previewDebounceMs : 0.0);
+            stretching = true;
+            if (immediate && !previewBuildRunning) startPendingPreviewBuild();
             repaint();
         }
 
         void startPendingPreviewBuild()
         {
-            if (previewBuildRunning
-                || !previewBuildPending)
+            if (previewBuildRunning) return;
+            PreviewRenderer::Request request;
+            if (previewBuildPending)
             {
-                return;
+                if (!hasCurrentSource()) { previewBuildPending = false; stretching = false; return; }
+                request = currentRenderRequest();
+                if (request.sampleRate <= 0.0 || (request.host && (request.sourceBpm <= 0.0 || request.bpm <= 0.0)))
+                { previewBuildPending = false; stretching = false; return; }
+                const auto cached = preparedPreviews.find(request.key);
+                if (cached != preparedPreviews.end())
+                {
+                    cached->second.lastUse = ++previewCacheClock;
+                    applyPreparedPreview(cached->second.result);
+                    return;
+                }
+                previewBuildPending = false;
             }
-
-            if (sourceMusicalSamples <= 0
-                || sourceSampleRate <= 0.0
-                || pendingPreviewBpm <= 0.0
-                || pendingPreviewSampleRate <= 0.0)
+            else
             {
-                previewBuildPending =
-                    false;
-
-                stretching =
-                    false;
-
-                return;
+                if (nearbyRenders.empty()) return;
+                request = nearbyRenders.front();
+                nearbyRenders.erase(nearbyRenders.begin());
+                if (preparedPreviews.count(request.key) > 0) return;
             }
+            previewBuildRunning = true;
+            previewBuildFuture = std::async(std::launch::async,
+                [request] { return PreviewRenderer::render(request); });
+        }
 
-            const double targetBpm =
-                pendingPreviewBpm;
-
-            const double targetSampleRate =
-                pendingPreviewSampleRate;
-
-            juce::AudioBuffer<float>
-                sourceSnapshot;
-
-            sourceSnapshot.makeCopyOf(
-                sourceBuffer);
-
-            const int musicalSamples =
-                sourceMusicalSamples;
-
-            const double sourceRate =
-                sourceSampleRate;
-
-            const double sourceTempo =
-                sourceBpm;
-            const auto buildSourceGeneration = sourceGeneration;
-
-            previewBuildPending =
-                false;
-
-            previewBuildRunning =
-                true;
-
-            previewBuildFuture =
-                std::async(
-                    std::launch::async,
-                    [
-                        sourceSnapshot =
-                            std::move(
-                                sourceSnapshot),
-                        musicalSamples,
-                        sourceRate,
-                        sourceTempo,
-                        targetBpm,
-                        targetSampleRate,
-                        buildSourceGeneration
-                    ]() mutable
-                    {
-                        HostPreviewBuildResult
-                            result;
-                        result.sourceGeneration = buildSourceGeneration;
-
-                        result.bpm =
-                            targetBpm;
-
-                        result.sampleRate =
-                            targetSampleRate;
-
-                        if (musicalSamples <= 0
-                            || sourceRate <= 0.0
-                            || sourceTempo <= 0.0
-                            || targetBpm <= 0.0
-                            || targetSampleRate <= 0.0)
-                        {
-                            return result;
-                        }
-
-                        const int channels =
-                            sourceSnapshot
-                                .getNumChannels();
-
-                        if (channels <= 0)
-                            return result;
-
-                        const double lengthRatio =
-                            sourceTempo
-                            / targetBpm;
-
-                        const int
-                            stretchedSamplesAtSourceRate =
-                                std::max(
-                                    1,
-                                    static_cast<int>(
-                                        std::llround(
-                                            musicalSamples
-                                            * lengthRatio)));
-
-                        signalsmith::stretch::
-                            SignalsmithStretch<float>
-                                stretch;
-
-                        stretch.presetDefault(
-                            channels,
-                            sourceRate);
-
-                        stretch.setTransposeFactor(
-                            1.0);
-
-                        std::vector<
-                            const float*>
-                            inputPointers(
-                                static_cast<
-                                    size_t>(
-                                    channels));
-
-                        for (int channel = 0;
-                             channel < channels;
-                             ++channel)
-                        {
-                            inputPointers[
-                                static_cast<
-                                    size_t>(
-                                    channel)] =
-                                sourceSnapshot
-                                    .getReadPointer(
-                                        channel);
-                        }
-
-                        juce::AudioBuffer<float>
-                            stretchedAtSourceRate;
-
-                        stretchedAtSourceRate
-                            .setSize(
-                                channels,
-                                stretchedSamplesAtSourceRate);
-
-                        std::vector<float*>
-                            outputPointers(
-                                static_cast<
-                                    size_t>(
-                                    channels));
-
-                        for (int channel = 0;
-                             channel < channels;
-                             ++channel)
-                        {
-                            outputPointers[
-                                static_cast<
-                                    size_t>(
-                                    channel)] =
-                                stretchedAtSourceRate
-                                    .getWritePointer(
-                                        channel);
-                        }
-
-                        stretch.exact(
-                            inputPointers.data(),
-                            musicalSamples,
-                            outputPointers.data(),
-                            stretchedSamplesAtSourceRate);
-
-                        const double
-                            resampleRatio =
-                                sourceRate
-                                / targetSampleRate;
-
-                        const int hostSamples =
-                            std::max(
-                                1,
-                                static_cast<int>(
-                                    std::llround(
-                                        stretchedSamplesAtSourceRate
-                                        * targetSampleRate
-                                        / sourceRate)));
-
-                        result.buffer.setSize(
-                            channels,
-                            hostSamples);
-
-                        for (int channel = 0;
-                             channel < channels;
-                             ++channel)
-                        {
-                            juce::LagrangeInterpolator
-                                interpolator;
-
-                            interpolator.process(
-                                resampleRatio,
-                                stretchedAtSourceRate
-                                    .getReadPointer(
-                                        channel),
-                                result.buffer
-                                    .getWritePointer(
-                                        channel),
-                                hostSamples);
-                        }
-
-                        result.success =
-                            result.buffer
-                                    .getNumSamples()
-                                > 0;
-
-                        return result;
-                    });
+        void trimPreparedCache()
+        {
+            for (;;)
+            {
+                int64_t bytes = 0;
+                for (const auto& entry : preparedPreviews)
+                    bytes += static_cast<int64_t>(entry.second.result.buffer->getNumSamples())
+                        * entry.second.result.buffer->getNumChannels() * sizeof(float);
+                if (preparedPreviews.size() <= 12 && bytes <= 128 * 1024 * 1024) return;
+                auto oldest = preparedPreviews.end();
+                for (auto it = preparedPreviews.begin(); it != preparedPreviews.end(); ++it)
+                    if (it->first != appliedRenderKey
+                        && (oldest == preparedPreviews.end() || it->second.lastUse < oldest->second.lastUse)) oldest = it;
+                if (oldest == preparedPreviews.end()) return;
+                if (oldest->second.result.request.host && oldest->second.result.request.hostFile != activeHostPreviewFile)
+                    oldest->second.result.request.hostFile.deleteFile();
+                preparedPreviews.erase(oldest);
+            }
         }
 
         void finishPreviewBuildIfReady()
         {
-            if (!previewBuildRunning
-                || !previewBuildFuture.valid())
+            if (!previewBuildRunning || !previewBuildFuture.valid()
+                || previewBuildFuture.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) return;
+            auto result = previewBuildFuture.get();
+            previewBuildRunning = false;
+            const bool current = hasCurrentSource() && result.request.generation == sourceGeneration
+                && result.request.key == currentRenderRequest().key;
+            if (result.buffer)
             {
-                return;
+                juce::Logger::writeToLog("PREVIEW RENDER: " + juce::String(result.milliseconds, 1)
+                    + " ms / " + juce::String(result.request.semitones) + " st / "
+                    + (result.request.host ? "host" : "solo"));
+                preparedPreviews[result.request.key] = { result, ++previewCacheClock };
+                if (current) applyPreparedPreview(result);
+                trimPreparedCache();
             }
-
-            const auto status =
-                previewBuildFuture.wait_for(
-                    std::chrono::milliseconds(
-                        0));
-
-            if (status
-                != std::future_status::ready)
+            else if (current)
             {
-                return;
+                renderError = result.error;
+                stretching = false;
+                previewBuildPending = false;
+                juce::Logger::writeToLog(renderError);
             }
-
-            HostPreviewBuildResult result =
-                previewBuildFuture.get();
-
-            previewBuildRunning =
-                false;
-
-            if (!result.success)
-            {
-                if (!previewBuildPending)
-                    stretching = false;
-
-                return;
-            }
-
-            const bool stillCurrent =
-                result.sourceGeneration == sourceGeneration
-                && std::abs(
-                    result.bpm
-                    - hostBpm)
-                    <= 0.01
-                && std::abs(
-                       result.sampleRate
-                       - hostSampleRate)
-                       <= 0.5;
-
-            if (stillCurrent)
-            {
-                hostPreviewBuffer =
-                    std::move(
-                        result.buffer);
-
-                stretchedForHostBpm =
-                    result.bpm;
-
-                stretchedForHostSampleRate =
-                    result.sampleRate;
-
-                writeHostPreviewCache();
-            }
-
-            if (previewBuildPending)
-            {
-                stretching =
-                    true;
-            }
-            else if (!stillCurrent
-                     && (loadedBrowserLoopIndex < 0
-                         || loadedBrowserLoopIndex == selectedLoopIndex))
-            {
-                scheduleHostPreviewBuild(
-                    false);
-            }
-            else
-            {
-                stretching =
-                    false;
-            }
-
             repaint();
         }
 
-        void writeHostPreviewCache()
+        void prepareNearbyLoops()
         {
-            if (hostPreviewBuffer
-                    .getNumSamples()
-                <= 0
-                || stretchedForHostSampleRate
-                       <= 0.0)
+            if (nearbyRenderCentre < 0 || nearbyRenderCentre != selectedLoopIndex
+                || previewBuildPending || stretching
+                || juce::Time::getMillisecondCounterHiRes() - nearbyRenderRequestedMs < 300.0) return;
+            const auto centre = nearbyRenderCentre;
+            nearbyRenderCentre = -1;
+            for (const int index : { centre + 1, centre - 1 })
             {
-                return;
+                if (index < 0 || index >= static_cast<int>(loopItems.size())) continue;
+                const auto& item = loopItems[static_cast<size_t>(index)];
+                const auto identity = getLoopCacheKey(item);
+                const auto cached = gmailLoopCache.find(identity);
+                auto file = getDownloadedLoopFile(item);
+                if (!file.existsAsFile() && cached != gmailLoopCache.end()) file = cached->second;
+                if (!file.existsAsFile())
+                    file = GmailClient::getAttachmentCacheFile(item.messageId, item.attachmentId,
+                        item.filename, getLoopCacheDirectory());
+                if (!file.existsAsFile()) continue;
+                auto request = makeRenderRequest(file, identity, item.bpm.value_or(0.0), effectivePitch(item.musicalKey, 0));
+                if (request.sampleRate <= 0.0 || (request.host && (request.sourceBpm <= 0.0 || request.bpm <= 0.0))
+                    || preparedPreviews.count(request.key) > 0) continue;
+                // Speculative results populate the cache but cannot publish.
+                request.generation = std::numeric_limits<uint64_t>::max();
+                nearbyRenders.push_back(std::move(request));
             }
-
-            const auto cacheDirectory =
-                juce::File::
-                    getSpecialLocation(
-                        juce::File::
-                            tempDirectory)
-                    .getChildFile(
-                        "LoopBridge");
-
-            if (!cacheDirectory.exists())
-            {
-                cacheDirectory
-                    .createDirectory();
-            }
-
-            const auto cacheFile =
-                cacheDirectory
-                    .getChildFile(
-                        "preview.wav");
-
-            cacheFile.deleteFile();
-
-            juce::WavAudioFormat
-                wavFormat;
-
-            std::unique_ptr<
-                juce::FileOutputStream>
-                outputStream(
-                    cacheFile
-                        .createOutputStream());
-
-            if (outputStream == nullptr)
-                return;
-
-            std::unique_ptr<
-                juce::AudioFormatWriter>
-                writer(
-                    wavFormat
-                        .createWriterFor(
-                            outputStream.get(),
-                            stretchedForHostSampleRate,
-                            static_cast<
-                                unsigned int>(
-                                hostPreviewBuffer
-                                    .getNumChannels()),
-                            32,
-                            {},
-                            0));
-
-            if (writer == nullptr)
-                return;
-
-            outputStream.release();
-
-            const bool wrote =
-                writer
-                    ->writeFromAudioSampleBuffer(
-                        hostPreviewBuffer,
-                        0,
-                        hostPreviewBuffer
-                            .getNumSamples());
-
-            writer.reset();
-
-            if (!wrote)
-                return;
-
-            sendLoadCommand(
-                cacheFile);
-
-            sendBridgeState();
-
-            if (haveHostState)
-            {
-                sendRephaseCommand(
-                    hostPpq);
-            }
-
-            hostPreviewReady =
-                true;
-            sendPreviewState();
         }
 
         bool isHostConnected() const
@@ -2979,6 +2766,7 @@ private:
             {
                 stopSoloPreview();
                 hostPreviewEnabled = true;
+                scheduleHostPreviewBuild(true);
                 sendPreviewState();
                 repaint();
             }
@@ -3062,54 +2850,27 @@ private:
 
         void startSoloPreview()
         {
-            if (bridgeEnabled)
-                return;
-            if (soloBuffer
-                    .getNumSamples()
-                <= 0)
+            if (bridgeEnabled || !hasCurrentSource()) return;
             {
-                return;
+                const juce::ScopedLock lock(audioLock);
+                soloPreviewIntent = true;
+                soloPlaying = soloPreviewReady && soloBuffer != nullptr;
+                if (soloBuffer && soloPlaybackPosition >= soloBuffer->getNumSamples()) soloPlaybackPosition = 0;
             }
-
-            {
-                const juce::ScopedLock lock(
-                    audioLock);
-
-                soloPlaybackPosition =
-                    0;
-
-                soloPlaying =
-                    true;
-            }
-
-            playButton.setEnabled(
-                false);
-
-            stopButton.setEnabled(
-                true);
-
+            if (!soloPreviewReady) scheduleHostPreviewBuild(true);
             repaint();
         }
 
         void stopSoloPreview()
         {
             {
-                const juce::ScopedLock lock(
-                    audioLock);
-
-                soloPlaying =
-                    false;
-
-                soloPlaybackPosition =
-                    0;
+                const juce::ScopedLock lock(audioLock);
+                soloPlaying = false;
+                soloPreviewIntent = false;
+                soloPlaybackPosition = 0;
             }
-
-            playButton.setEnabled(
-                sourceMusicalSamples > 0);
-
-            stopButton.setEnabled(
-                false);
-
+            playButton.setEnabled(sourceMusicalSamples > 0);
+            stopButton.setEnabled(false);
             repaint();
         }
 
@@ -3303,8 +3064,7 @@ private:
             {
                 sendBridgeState();
                 if (hostPreviewReady)
-                    sendLoadCommand(juce::File::getSpecialLocation(juce::File::tempDirectory)
-                        .getChildFile("LoopBridge").getChildFile("preview.wav"));
+                    sendLoadCommand(activeHostPreviewFile);
                 sendPreviewState();
             }
 
@@ -3316,11 +3076,11 @@ private:
             }
 
             const bool needsInitialPreview =
-                !hostPreviewReady
+                bridgeEnabled && !hostPreviewReady && renderError.isEmpty()
                 && !previewBuildPending
                 && !previewBuildRunning;
 
-            if (sourceMusicalSamples > 0
+            if (bridgeEnabled && sourceMusicalSamples > 0
                 && (loadedBrowserLoopIndex < 0 || loadedBrowserLoopIndex == selectedLoopIndex)
                 && (bpmChanged
                     || sampleRateChanged
@@ -3375,7 +3135,11 @@ private:
                 stopButton.setEnabled(hostPreviewEnabled && sourceMusicalSamples > 0);
             }
             else
-                playButton.setButtonText("Play");
+            {
+                playButton.setButtonText(soloPreviewIntent ? "Pause" : "Play");
+                playButton.setEnabled(sourceMusicalSamples > 0);
+                stopButton.setEnabled(soloPreviewIntent);
+            }
 
             if (pendingPrefetchCentre >= 0)
             {
@@ -3395,6 +3159,10 @@ private:
                     prefetchLoop(neighbour);
                 }
             }
+
+            prepareNearbyLoops();
+            if (!previewBuildPending && !previewBuildRunning && !nearbyRenders.empty())
+                startPendingPreviewBuild();
 
             if (previewBuildPending
                 && !previewBuildRunning)
@@ -3444,8 +3212,7 @@ private:
         double sourceSampleRate =
             0.0;
 
-        double deviceSampleRate =
-            0.0;
+        std::atomic<double> deviceSampleRate { 0.0 };
 
         bool haveHostState =
             false;
@@ -3485,11 +3252,28 @@ private:
         double previewBuildRequestedMs =
             0.0;
 
-        double pendingPreviewBpm =
-            0.0;
-
-        double pendingPreviewSampleRate =
-            0.0;
+        juce::ComboBox projectKeySelector;
+        juce::ToggleButton keySyncButton;
+        juce::TextButton pitchMinus, pitchPlus;
+        juce::Label pitchLabel, keyStatusLabel;
+        std::unique_ptr<juce::PropertiesFile> settings;
+        int projectKeyId = 1;
+        int manualSemitones = 0;
+        std::optional<MusicalKey> sourceKey;
+        juce::File originalPreviewFile;
+        juce::String originalPreviewIdentity;
+        juce::String appliedRenderKey, renderError;
+        juce::File activeHostPreviewFile;
+        juce::File preparedDirectory = juce::File::getSpecialLocation(juce::File::tempDirectory)
+            .getChildFile("LoopBridge").getChildFile("prepared").getChildFile(juce::Uuid().toString());
+        std::map<juce::String, CachedPreview> preparedPreviews;
+        uint64_t previewCacheClock = 0;
+        std::vector<PreviewRenderer::Request> nearbyRenders;
+        int nearbyRenderCentre = -1;
+        double nearbyRenderRequestedMs = 0.0;
+        int sourceTotalSamples = 0;
+        bool soloPreviewReady = false;
+        bool soloPreviewIntent = false;
 
         std::future<
             HostPreviewBuildResult>
@@ -3504,14 +3288,8 @@ private:
         juce::AudioFormatManager
             formatManager;
 
-        juce::AudioBuffer<float>
-            sourceBuffer;
-
-        juce::AudioBuffer<float>
-            soloBuffer;
-
-        juce::AudioBuffer<float>
-            hostPreviewBuffer;
+        std::shared_ptr<const juce::AudioBuffer<float>> soloBuffer;
+        std::shared_ptr<const juce::AudioBuffer<float>> hostPreviewBuffer;
 
         juce::CriticalSection
             audioLock;
