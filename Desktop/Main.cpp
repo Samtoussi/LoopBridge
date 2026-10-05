@@ -241,9 +241,7 @@ private:
                         gmailStatus =
                             "GMAIL: NOT CONNECTED";
 
-                        loopItems.clear();
-                        selectedLoopIndex = -1;
-                        browserScrollIndex = 0;
+                        // Keep known rows available for local/offline preview.
 
                         repaint();
                         return;
@@ -278,145 +276,7 @@ private:
                                 gmailStatus =
                                     "GMAIL: CONNECTED";
 
-                                juce::Logger::writeToLog(
-                                    "\n==============================\n"
-                                    "LOOPBRIDGE GMAIL LIBRARY\n"
-                                    "==============================");
-
-                                gmailClient.fetchRecentAudioAttachments(
-                                    100,
-                                    [this](
-                                        const std::vector<
-                                            GmailClient::AudioAttachment>& attachments,
-                                        const juce::String& error)
-                                    {
-                                        if (error.isNotEmpty())
-                                        {
-                                            juce::Logger::writeToLog(
-                                                "GMAIL ERROR: "
-                                                + error);
-
-                                            gmailStatus =
-                                                "GMAIL ERROR: "
-                                                + error;
-
-                                            repaint();
-                                            return;
-                                        }
-
-                                        loopItems.clear();
-
-                                        loopItems.reserve(
-                                            attachments.size());
-
-                                        for (const auto& attachment
-                                             : attachments)
-                                        {
-                                            LoopItem item;
-
-                                            item.messageId =
-                                                attachment.messageId;
-
-                                            item.attachmentId =
-                                                attachment.attachmentId;
-
-                                            item.filename =
-                                                attachment.filename;
-
-                                            item.subject =
-                                                attachment.subject;
-
-                                            parseSender(
-                                                attachment.sender,
-                                                item.senderName,
-                                                item.senderEmail);
-
-                                            MetadataParser::parse(
-                                                item);
-
-                                            loopItems.push_back(
-                                                std::move(item));
-                                        }
-
-                                        selectedLoopIndex =
-                                            loopItems.empty()
-                                                ? -1
-                                                : 0;
-
-                                        browserScrollIndex =
-                                            0;
-
-                                        gmailStatus =
-                                            "GMAIL: "
-                                            + juce::String(
-                                                static_cast<int>(
-                                                    loopItems.size()))
-                                            + " AUDIO FILES FOUND";
-
-                                        juce::Logger::writeToLog(
-                                            "Audio attachments found: "
-                                            + juce::String(
-                                                static_cast<int>(
-                                                    loopItems.size())));
-
-                                        juce::Logger::writeToLog(
-                                            "------------------------------");
-
-                                        for (size_t i = 0;
-                                             i < loopItems.size();
-                                             ++i)
-                                        {
-                                            const auto& item =
-                                                loopItems[i];
-
-                                            juce::String line =
-                                                juce::String(
-                                                    static_cast<int>(
-                                                        i + 1))
-                                                + ". "
-                                                + item.filename;
-
-                                            line +=
-                                                " | "
-                                                + getSenderDisplayName(
-                                                    item);
-
-                                            line +=
-                                                " | BPM: ";
-
-                                            if (item.bpm.has_value())
-                                            {
-                                                line +=
-                                                    juce::String(
-                                                        *item.bpm,
-                                                        0);
-                                            }
-                                            else
-                                            {
-                                                line += "--";
-                                            }
-
-                                            line +=
-                                                " | KEY: ";
-
-                                            if (item.key.isNotEmpty())
-                                            {
-                                                line +=
-                                                    item.key;
-                                            }
-                                            else
-                                            {
-                                                line += "--";
-                                            }
-
-                                            juce::Logger::writeToLog(
-                                                line);
-                                        }
-
-                                        grabKeyboardFocus();
-
-                                        repaint();
-                                    });
+                                startGmailSync();
                             }
                             else if (state
                                      == GmailClient::State::authorizing)
@@ -450,6 +310,15 @@ private:
                             repaint();
                         });
                 };
+
+            gmailClient.restoreLibrary([this](const GmailClient::LibraryUpdate& update)
+            {
+                mergeGmailLibrary(update);
+                if (!loopItems.empty())
+                    gmailStatus = "GMAIL: " + juce::String(static_cast<int>(loopItems.size()))
+                        + " KNOWN AUDIO FILES (OFFLINE)";
+                repaint();
+            });
 
             // Desktop audio is ONLY used
             // for manual solo preview.
@@ -1431,6 +1300,71 @@ private:
             return item.messageId
                 + "|"
                 + item.attachmentId;
+        }
+
+        void mergeGmailLibrary(const GmailClient::LibraryUpdate& update)
+        {
+            if (update.account.isEmpty())
+                return;
+            if (libraryAccount.isNotEmpty() && libraryAccount != update.account)
+            {
+                // An authenticated account switch must not retain the old rows
+                // or pending browser work. Same-account sync never takes this path.
+                cancelPendingBrowserPreview();
+                gmailClient.discardQueuedNavigation();
+                ++sourceGeneration;
+                nearbyRenders.clear();
+                nearbyRenderCentre = -1;
+                previewBuildPending = false;
+                stretching = false;
+                pendingPrefetchCentre = -1;
+                downloadsInFlight.clear();
+                loadedBrowserLoopIndex = -1;
+                loopItems.clear();
+                selectedLoopIndex = -1;
+                browserScrollIndex = 0;
+                gmailLoopCache.clear();
+                gmailLoopDurations.clear();
+            }
+            libraryAccount = update.account;
+            std::set<juce::String> known;
+            for (const auto& item : loopItems)
+                known.insert(getLoopCacheKey(item));
+            for (const auto& attachment : update.attachments)
+            {
+                if (!known.insert(attachment.messageId + "|" + attachment.attachmentId).second)
+                    continue;
+                LoopItem item;
+                item.messageId = attachment.messageId;
+                item.attachmentId = attachment.attachmentId;
+                item.filename = attachment.filename;
+                item.subject = attachment.subject;
+                parseSender(attachment.sender, item.senderName, item.senderEmail);
+                MetadataParser::parse(item);
+                // Append instead of replacing/reordering: indices captured by
+                // active and pending previews, selection, and prefetch stay valid.
+                loopItems.push_back(std::move(item));
+            }
+            if (selectedLoopIndex < 0 && !loopItems.empty())
+                selectedLoopIndex = 0;
+        }
+
+        void startGmailSync()
+        {
+            gmailClient.fetchRecentAudioAttachments(100, [this](const GmailClient::LibraryUpdate& update)
+            {
+                mergeGmailLibrary(update);
+                nextGmailSyncMs = juce::Time::getMillisecondCounterHiRes() + update.nextSyncDelayMs;
+                if (update.error.isNotEmpty())
+                {
+                    juce::Logger::writeToLog("GMAIL SYNC: " + update.error);
+                    gmailStatus = "GMAIL: SYNC PAUSED; KNOWN FILES AVAILABLE";
+                }
+                else
+                    gmailStatus = "GMAIL: " + juce::String(static_cast<int>(loopItems.size()))
+                        + " AUDIO FILES";
+                repaint();
+            });
         }
 
         juce::File getLoopCacheDirectory() const
@@ -3093,6 +3027,11 @@ private:
 
         void timerCallback() override
         {
+            if (gmailClient.getState() == GmailClient::State::connected
+                && !gmailClient.isLibrarySyncActive()
+                && juce::Time::getMillisecondCounterHiRes() >= nextGmailSyncMs)
+                startGmailSync();
+
             while (true)
             {
                 char buffer[256] {};
@@ -3336,6 +3275,9 @@ private:
 
         std::map<juce::String, juce::File>
             gmailLoopCache;
+
+        juce::String libraryAccount;
+        double nextGmailSyncMs = 0.0;
 
         int pendingPrefetchCentre = -1;
         int pendingPrefetchStep = 0;

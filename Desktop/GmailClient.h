@@ -35,10 +35,15 @@ public:
         juce::String subject;
     };
 
-    using AudioListCallback =
-        std::function<void(
-            const std::vector<AudioAttachment>&,
-            const juce::String&)>;
+    struct LibraryUpdate
+    {
+        juce::String account;
+        std::vector<AudioAttachment> attachments;
+        juce::String error;
+        bool accountVerified = false;
+        int nextSyncDelayMs = 120000;
+    };
+    using LibraryCallback = std::function<void(const LibraryUpdate&)>;
 
     using DownloadCallback =
         std::function<void(
@@ -55,7 +60,7 @@ public:
         juce::String message;
     };
 
-    GmailClient();
+    explicit GmailClient(const juce::File& indexFile = {});
     ~GmailClient();
 
     void connect(
@@ -69,7 +74,9 @@ public:
 
     void fetchRecentAudioAttachments(
         int maxMessages,
-        AudioListCallback callback);
+        LibraryCallback callback);
+    void restoreLibrary(LibraryCallback callback);
+    bool isLibrarySyncActive() const { return librarySyncActive; }
 
     void downloadAudioAttachment(
         const juce::String& messageId,
@@ -103,6 +110,20 @@ private:
         std::atomic<uint64_t> generation { 0 };
     };
     class Worker;
+    struct DiscoveryIndex
+    {
+        struct Message
+        {
+            juce::String id, sender, subject;
+            std::vector<AudioAttachment> attachments;
+        };
+        juce::String account;
+        std::vector<Message> messages;
+        bool load(const juce::File& file);
+        bool save(const juce::File& file) const;
+        bool knows(const juce::String& id) const;
+        std::vector<AudioAttachment> attachments() const;
+    };
     struct PendingAttachment
     {
         std::vector<DownloadCallback> callbacks;
@@ -112,6 +133,7 @@ private:
     // Message-thread-only: workers capture immutable request data.
     std::map<juce::String, std::shared_ptr<PendingAttachment>> pendingAttachments;
     RequestError lastRequestError; // Message-thread-only structured diagnostics.
+    bool librarySyncActive = false;
 
     struct OAuthCredentials
     {
@@ -152,8 +174,8 @@ private:
         juce::var& jsonResult,
         juce::String& errorMessage, const juce::String& accessToken, Worker& worker);
 
-    static void fetchRecentAudioAttachmentsSync(int maxMessages,
-        AudioListCallback callback, const juce::String& accessToken, Worker& worker);
+    static LibraryUpdate fetchRecentAudioAttachmentsSync(int maxMessages,
+        const juce::String& accessToken, Worker& worker);
     static void downloadAudioAttachmentSync(const juce::String& messageId,
         const juce::String& attachmentId, const juce::String& filename,
         const juce::File& destinationDirectory, DownloadCallback callback,
@@ -189,6 +211,9 @@ private:
     OAuthCredentials credentials;
 
     juce::String accessToken;
+    // Until discovery verifies /me/profile, uncached attachment acquisition has
+    // no access token. Cached files remain available through the existing path.
+    juce::String unverifiedAccessToken;
     juce::String refreshToken;
 
     juce::String codeVerifier;

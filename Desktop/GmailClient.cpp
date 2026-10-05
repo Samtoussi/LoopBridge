@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <optional>
 #if defined(LOOPBRIDGE_GMAIL_TESTS)
  #include <iostream>
 #endif
@@ -398,6 +399,87 @@ namespace
 #endif
 }
 
+bool GmailClient::DiscoveryIndex::load(const juce::File& file)
+{
+    const auto json = juce::JSON::parse(file.loadFileAsString());
+    if (!json.isObject() || static_cast<int>(json["version"]) != 1
+        || !json["account"].isString() || json["account"].toString().trim().isEmpty()
+        || !json["messages"].isArray())
+        return false;
+
+    DiscoveryIndex restored;
+    restored.account = json["account"].toString().trim().toLowerCase();
+    for (const auto& row : *json["messages"].getArray())
+    {
+        if (!row.isObject() || !row["id"].isString() || row["id"].toString().isEmpty()
+            || !row["sender"].isString() || !row["subject"].isString()
+            || !row["attachments"].isArray() || restored.knows(row["id"].toString()))
+            return false;
+        Message message { row["id"].toString(), row["sender"].toString(),
+                          row["subject"].toString(), {} };
+        for (const auto& entry : *row["attachments"].getArray())
+        {
+            if (!entry.isObject() || !entry["id"].isString() || entry["id"].toString().isEmpty()
+                || !entry["filename"].isString() || entry["filename"].toString().isEmpty())
+                return false;
+            message.attachments.push_back({ message.id, entry["id"].toString(),
+                entry["filename"].toString(), message.sender, message.subject });
+        }
+        restored.messages.push_back(std::move(message));
+    }
+    *this = std::move(restored);
+    return true;
+}
+
+bool GmailClient::DiscoveryIndex::save(const juce::File& file) const
+{
+    if (account.isEmpty() || file.getParentDirectory().createDirectory().failed())
+        return false;
+    auto* root = new juce::DynamicObject();
+    juce::var json(root);
+    root->setProperty("version", 1);
+    root->setProperty("account", account);
+    juce::Array<juce::var> rows;
+    for (const auto& message : messages)
+    {
+        auto* row = new juce::DynamicObject();
+        juce::var value(row);
+        row->setProperty("id", message.id);
+        row->setProperty("sender", message.sender);
+        row->setProperty("subject", message.subject);
+        juce::Array<juce::var> entries;
+        for (const auto& attachment : message.attachments)
+        {
+            auto* entry = new juce::DynamicObject();
+            juce::var item(entry);
+            entry->setProperty("id", attachment.attachmentId);
+            entry->setProperty("filename", attachment.filename);
+            entries.add(item);
+        }
+        row->setProperty("attachments", juce::var(entries));
+        rows.add(value);
+    }
+    root->setProperty("messages", juce::var(rows));
+    // A sibling temporary file keeps replacement on the same filesystem.
+    juce::TemporaryFile staging(file);
+    return staging.getFile().replaceWithText(juce::JSON::toString(json, true))
+        && staging.overwriteTargetFileWithTemporary();
+}
+
+bool GmailClient::DiscoveryIndex::knows(const juce::String& id) const
+{
+    return std::any_of(messages.begin(), messages.end(),
+        [&id](const Message& message) { return message.id == id; });
+}
+
+std::vector<GmailClient::AudioAttachment> GmailClient::DiscoveryIndex::attachments() const
+{
+    std::vector<AudioAttachment> result;
+    for (const auto& message : messages)
+        result.insert(result.end(), message.attachments.begin(), message.attachments.end());
+    return result;
+}
+
 class GmailClient::Worker final : public juce::Thread
 {
 public:
@@ -411,8 +493,8 @@ public:
         bool explicitDownload = false;
     };
 
-    explicit Worker(std::shared_ptr<Lifetime> state)
-        : juce::Thread("LoopBridge Gmail requests"), lifetime(std::move(state))
+    explicit Worker(std::shared_ptr<Lifetime> state, const juce::File& file = {})
+        : juce::Thread("LoopBridge Gmail requests"), indexFile(file), lifetime(std::move(state))
     {
         startThread();
     }
@@ -606,13 +688,26 @@ public:
     // Accessed only by this worker; shared by listing and attachment requests.
     double cooldownUntil = 0.0;
     RequestError lastError, quotaError;
+    DiscoveryIndex index;
+    const juce::File indexFile;
+    std::optional<uint64_t> verifiedGeneration;
+    void loadIndex()
+    {
+        if (!indexLoaded)
+        {
+            index.load(indexFile);
+            indexLoaded = true;
+        }
+    }
 
 private:
+    friend class GmailClient;
     std::shared_ptr<Lifetime> lifetime;
     uint64_t runningGeneration = 0;
     juce::CriticalSection queueLock, streamLock;
     std::vector<Job> jobs;
     juce::WebInputStream* activeStream = nullptr;
+    bool indexLoaded = false;
 };
 
 class GmailAuthThread final
@@ -898,7 +993,11 @@ private:
     const uint64_t generation;
 };
 
-GmailClient::GmailClient() : worker(std::make_unique<Worker>(lifetime)) {}
+GmailClient::GmailClient(const juce::File& indexFile)
+    : worker(std::make_unique<Worker>(lifetime, indexFile == juce::File{}
+        ? juce::File::getSpecialLocation(juce::File::userApplicationDataDirectory)
+            .getChildFile("LoopBridge").getChildFile("gmail-library.json")
+        : indexFile)) {}
 
 GmailClient::~GmailClient()
 {
@@ -936,7 +1035,9 @@ void GmailClient::connect(
     ++lifetime->generation;
     pendingAttachments.clear();
     worker->notify();
+    librarySyncActive = false;
     accessToken.clear();
+    unverifiedAccessToken.clear();
     refreshToken.clear();
 
     if (!loadCredentials(
@@ -956,6 +1057,7 @@ void GmailClient::connect(
 void GmailClient::disconnect()
 {
     ++lifetime->generation;
+    librarySyncActive = false;
     pendingAttachments.clear();
     worker->notify();
     if (authThread != nullptr)
@@ -970,6 +1072,7 @@ void GmailClient::disconnect()
     }
 
     accessToken.clear();
+    unverifiedAccessToken.clear();
     refreshToken.clear();
 
     setState(
@@ -1204,7 +1307,7 @@ void GmailClient::
                     setState(State::error, "Could not exchange Google authorization code for tokens.");
                     return;
                 }
-                accessToken = tokens.accessToken;
+                unverifiedAccessToken = tokens.accessToken;
                 refreshToken = tokens.refreshToken;
                 setState(State::connected, "Connected to Gmail");
             });
@@ -1545,217 +1648,146 @@ void GmailClient::collectAudioAttachments(
     }
 }
 
-void GmailClient::
-    fetchRecentAudioAttachments(
-        int maxMessages,
-        AudioListCallback callback)
+void GmailClient::restoreLibrary(LibraryCallback callback)
 {
-    jassert(juce::MessageManager::getInstance()->isThisTheMessageThread());
-    if (!callback)
-        return;
-    if (state != State::connected || accessToken.isEmpty())
-    {
-        callback({}, "Gmail is not connected.");
-        return;
-    }
     const auto session = getSessionGeneration();
-    worker->enqueue({ {}, Priority::download, session,
-        [this, guard = lifetime, session, token = accessToken, maxMessages,
-         callback = std::move(callback)](Worker& background)
+    worker->enqueue({ {}, Priority::preview, session,
+        [guard = lifetime, session, callback = std::move(callback)](Worker& background)
         {
-            fetchRecentAudioAttachmentsSync(maxMessages,
-                [this, guard, session, callback, &background](const std::vector<AudioAttachment>& files,
-                                           const juce::String& error)
-                {
-                    juce::MessageManager::callAsync([this, guard, session, callback, files, error,
-                                                    details = background.lastError]
-                    {
-                        if (guard->alive.load() && guard->generation.load() == session)
-                        {
-                            lastRequestError = details;
-                            callback(files, error);
-                        }
-                    });
-                }, token, background);
+            background.loadIndex();
+            LibraryUpdate update;
+            update.account = background.index.account;
+            update.attachments = background.index.attachments();
+            juce::MessageManager::callAsync([guard, session, callback, update]
+            {
+                if (guard->alive.load() && guard->generation.load() == session && callback)
+                    callback(update);
+            });
         }, {} });
 }
 
-void GmailClient::fetchRecentAudioAttachmentsSync(
-    int maxMessages, AudioListCallback callback,
-    const juce::String& accessToken, Worker& worker)
+void GmailClient::fetchRecentAudioAttachments(int maxMessages, LibraryCallback callback)
 {
-    if (!callback)
+    jassert(juce::MessageManager::getInstance()->isThisTheMessageThread());
+    if (!callback || librarySyncActive)
+        return;
+    const auto token = accessToken.isNotEmpty() ? accessToken : unverifiedAccessToken;
+    if (state != State::connected || token.isEmpty())
     {
+        LibraryUpdate update;
+        update.error = "Gmail is not connected.";
+        callback(update);
         return;
     }
-
-    if (accessToken.isEmpty())
-    {
-        callback(
-            {},
-            "Gmail is not connected.");
-
-        return;
-    }
-
-    maxMessages =
-        juce::jlimit(
-            1,
-            100,
-            maxMessages);
-
-    const auto listUrl =
-        juce::String(
-            gmailApiBase)
-        + "/messages?maxResults="
-        + juce::String(
-            maxMessages)
-        + "&q="
-        + urlEncode(
-            "has:attachment");
-
-    juce::var listJson;
-    juce::String error;
-
-    if (!performAuthorizedGet(
-            listUrl,
-            listJson,
-            error, accessToken, worker))
-    {
-        callback(
-            {},
-            error);
-
-        return;
-    }
-
-    auto* listObject =
-        listJson
-            .getDynamicObject();
-
-    if (listObject == nullptr)
-    {
-        callback(
-            {},
-            "Gmail message list was empty.");
-
-        return;
-    }
-
-    const auto messages =
-        listObject
-            ->getProperty(
-                "messages");
-
-    if (!messages.isArray())
-    {
-        callback(
-            {},
-            {});
-
-        return;
-    }
-
-    std::vector<AudioAttachment>
-        results;
-
-    for (const auto& message
-         : *messages.getArray())
-    {
-        worker.runUrgentAttachments();
-        auto* messageRef =
-            message
-                .getDynamicObject();
-
-        if (messageRef == nullptr)
+    librarySyncActive = true;
+    const auto session = getSessionGeneration();
+    worker->enqueue({ {}, Priority::download, session,
+        [this, guard = lifetime, session, token, maxMessages,
+         callback = std::move(callback)](Worker& background)
         {
-            continue;
-        }
-
-        const auto messageId =
-            messageRef
-                ->getProperty(
-                    "id")
-                .toString();
-
-        if (messageId.isEmpty())
-        {
-            continue;
-        }
-
-        const auto messageUrl =
-            juce::String(
-                gmailApiBase)
-            + "/messages/"
-            + urlEncode(
-                messageId)
-            + "?format=full";
-
-        juce::var messageJson;
-
-        if (!performAuthorizedGet(
-                messageUrl,
-                messageJson,
-                error, accessToken, worker))
-        {
-            callback(
-                {},
-                error);
-
-            return;
-        }
-
-        auto* messageObject =
-            messageJson
-                .getDynamicObject();
-
-        if (messageObject == nullptr)
-        {
-            continue;
-        }
-
-        const auto payload =
-            messageObject
-                ->getProperty(
-                    "payload");
-
-        auto* payloadObject =
-            payload
-                .getDynamicObject();
-
-        if (payloadObject == nullptr)
-        {
-            continue;
-        }
-
-        const auto headers =
-            payloadObject
-                ->getProperty(
-                    "headers");
-
-        const auto sender =
-            getHeaderValue(
-                headers,
-                "From");
-
-        const auto subject =
-            getHeaderValue(
-                headers,
-                "Subject");
-
-        collectAudioAttachments(
-            payload,
-            messageId,
-            sender,
-            subject,
-            results);
-    }
-
-    callback(
-        results,
-        {});
+            const auto update = fetchRecentAudioAttachmentsSync(maxMessages, token, background);
+            juce::MessageManager::callAsync([this, guard, session, token, callback, update,
+                                            details = background.lastError]
+            {
+                if (!guard->alive.load() || guard->generation.load() != session)
+                    return;
+                librarySyncActive = false;
+                lastRequestError = details;
+                if (update.accountVerified)
+                {
+                    accessToken = token;
+                    unverifiedAccessToken.clear();
+                }
+                callback(update);
+            });
+        }, {} });
 }
 
+GmailClient::LibraryUpdate GmailClient::fetchRecentAudioAttachmentsSync(
+    int maxMessages, const juce::String& accessToken, Worker& worker)
+{
+    worker.loadIndex();
+    bool verified = false;
+    const auto finish = [&](const juce::String& error)
+    {
+        LibraryUpdate update;
+        update.account = worker.index.account;
+        update.attachments = worker.index.attachments();
+        update.accountVerified = verified;
+        update.error = error;
+        if (error.isNotEmpty())
+        {
+            const double remaining = worker.cooldownUntil - juce::Time::getMillisecondCounterHiRes();
+            update.nextSyncDelayMs = remaining > 0.0 ? static_cast<int>(remaining) + 250 : 60000;
+        }
+        return update;
+    };
+    if (accessToken.isEmpty())
+        return finish("Gmail is not connected.");
+
+    juce::String error;
+    if (worker.verifiedGeneration != worker.runningGeneration)
+    {
+        juce::var profile;
+        if (!performAuthorizedGet(juce::String(gmailApiBase) + "/profile",
+                                  profile, error, accessToken, worker))
+            return finish(error);
+        const auto account = profile["emailAddress"].toString().trim().toLowerCase();
+        if (account.isEmpty())
+            return finish("Gmail profile did not identify the account.");
+        if (worker.index.account != account)
+        {
+            // This small index represents the last authenticated account only.
+            // Never carry known message IDs or rows into another account.
+            worker.index = {};
+            worker.index.account = account;
+        }
+        worker.verifiedGeneration = worker.runningGeneration;
+    }
+    verified = true;
+    if (!worker.index.save(worker.indexFile))
+        return finish("Could not save the Gmail discovery index.");
+
+    maxMessages = juce::jlimit(1, 100, maxMessages);
+    const auto listUrl = juce::String(gmailApiBase) + "/messages?maxResults="
+        + juce::String(maxMessages) + "&q=" + urlEncode("has:attachment");
+    juce::var listJson;
+    if (!performAuthorizedGet(listUrl, listJson, error, accessToken, worker))
+        return finish(error);
+    const auto messages = listJson["messages"];
+    if (messages.isVoid())
+        return finish({});
+    if (!messages.isArray())
+        return finish("Gmail returned an invalid message list.");
+
+    for (const auto& reference : *messages.getArray())
+    {
+        if (worker.cancelled())
+            return finish("Gmail synchronization cancelled.");
+        worker.runUrgentAttachments();
+        const auto id = reference["id"].toString();
+        if (id.isEmpty() || worker.index.knows(id))
+            continue;
+        juce::var messageJson;
+        if (!performAuthorizedGet(juce::String(gmailApiBase) + "/messages/"
+                                  + urlEncode(id) + "?format=full",
+                                  messageJson, error, accessToken, worker))
+            return finish(error);
+        const auto payload = messageJson["payload"];
+        if (!payload.isObject())
+            return finish("Gmail returned an invalid message payload.");
+        const auto headers = payload["headers"];
+        DiscoveryIndex::Message message { id, getHeaderValue(headers, "From"),
+                                         getHeaderValue(headers, "Subject"), {} };
+        collectAudioAttachments(payload, id, message.sender, message.subject, message.attachments);
+        worker.index.messages.push_back(std::move(message));
+        // Checkpoint even messages with no audio; a later HTTP failure or exit
+        // must not discard successful discovery or repeat it on the next launch.
+        if (!worker.index.save(worker.indexFile))
+            return finish("Could not save the Gmail discovery index.");
+    }
+    return finish({});
+}
 void GmailClient::
     downloadAudioAttachment(
         const juce::String& messageId,
@@ -2368,6 +2400,221 @@ int runGmailClientTests()
         }, {} });
         release.signal();
         check(pumpUntil([&] { return done.load(); }), "error handling completes");
+    }
+
+    {
+        GmailClient::DiscoveryIndex index;
+        index.account = "first@example.com";
+        index.messages.push_back({ "known", "Producer <producer@example.com>", "Loops", {
+            { "known", "wav", "beat_120_Cm.wav", "Producer <producer@example.com>", "Loops" },
+            { "known", "flac", "melody.flac", "Producer <producer@example.com>", "Loops" } } });
+        index.messages.push_back({ "non-audio", "Sender", "PDF only", {} });
+        const auto file = directory.getChildFile("roundtrip.json");
+        check(index.save(file), "atomic discovery index save");
+        GmailClient::DiscoveryIndex restored;
+        check(restored.load(file) && restored.account == index.account
+              && restored.knows("non-audio") && restored.messages.size() == 2,
+              "account and non-audio messages survive restart");
+        const auto rows = restored.attachments();
+        check(rows.size() == 2 && rows[0].messageId == "known" && rows[0].attachmentId == "wav"
+              && rows[0].filename == "beat_120_Cm.wav" && rows[0].sender == index.messages[0].sender
+              && rows[0].subject == "Loops", "attachment identity and row metadata roundtrip");
+        index.messages.push_back({ "later", "Sender", "No audio", {} });
+        check(index.save(file) && restored.load(file) && restored.knows("later"),
+              "replacement updates an existing index");
+        const auto corrupt = directory.getChildFile("corrupt.json");
+        check(corrupt.replaceWithText("{\"version\":1,\"account\":\"other@example.com\",\"messages\":[{}]}"),
+              "corrupt fixture written");
+        check(!restored.load(corrupt) && restored.account == "first@example.com"
+              && restored.knows("known"), "malformed index cannot partially replace valid state");
+    }
+
+    {
+        const auto file = directory.getChildFile("incremental.json");
+        GmailClient::DiscoveryIndex seed;
+        seed.account = "first@example.com";
+        seed.messages.push_back({ "known", "Sender", "Old loop", {
+            { "known", "old-audio", "old.wav", "Sender", "Old loop" } } });
+        seed.messages.push_back({ "non-audio", "Sender", "PDF", {} });
+        check(seed.save(file), "incremental fixture saved");
+        GmailClient client(file);
+        client.state = GmailClient::State::connected;
+        client.unverifiedAccessToken = "offline-test-token";
+        std::atomic<int> profiles { 0 }, lists { 0 }, details { 0 };
+        client.worker->testRequest = [&](const juce::URL& url)
+        {
+            check(!juce::MessageManager::getInstance()->isThisTheMessageThread(),
+                  "discovery HTTP runs off the UI thread");
+            const auto address = url.toString(true);
+            if (address.endsWith("/profile"))
+            {
+                ++profiles;
+                return Worker::Response { 200, {}, R"({"emailAddress":"FIRST@example.com"})" };
+            }
+            if (address.contains("/messages?"))
+            {
+                ++lists;
+                check(address.contains("maxResults=100") && address.contains("has%3Aattachment"),
+                      "bounded discovery query preserved");
+                return Worker::Response { 200, {},
+                    R"({"messages":[{"id":"known"},{"id":"non-audio"},{"id":"new"}]})" };
+            }
+            ++details;
+            check(address.contains("/messages/new?format=full"), "only unknown message fetched");
+            return Worker::Response { 200, {},
+                R"({"payload":{"headers":[{"name":"From","value":"New Producer"},{"name":"Subject","value":"New loops"}],"parts":[{"filename":"new.wav","mimeType":"audio/wav","body":{"attachmentId":"new-audio"}}]}})" };
+        };
+        bool restored = false;
+        client.restoreLibrary([&](const GmailClient::LibraryUpdate& update)
+        {
+            check(update.account == "first@example.com" && update.attachments.size() == 1
+                  && profiles == 0 && lists == 0, "startup restores known rows without Gmail");
+            restored = true;
+        });
+        check(pumpUntil([&] { return restored; }), "startup restoration completes");
+        int completed = 0;
+        const auto callback = [&](const GmailClient::LibraryUpdate& update)
+        {
+            check(update.error.isEmpty() && update.accountVerified && update.attachments.size() == 2
+                  && update.nextSyncDelayMs == 120000, "incremental snapshot and modest polling");
+            check(client.accessToken == "offline-test-token", "attachment token enabled after account verification");
+            ++completed;
+        };
+        client.fetchRecentAudioAttachments(100, callback);
+        client.fetchRecentAudioAttachments(100, callback);
+        check(client.isLibrarySyncActive(), "single-flight sync guard set");
+        check(pumpUntil([&] { return completed == 1; }) && !client.isLibrarySyncActive(),
+              "one concurrent synchronization and completion");
+        client.fetchRecentAudioAttachments(100, callback);
+        check(pumpUntil([&] { return completed == 2; }), "second poll completes");
+        check(profiles == 1 && lists == 2 && details == 1,
+              "profile once per session, known audio and non-audio messages skipped");
+        GmailClient::DiscoveryIndex disk;
+        check(disk.load(file) && disk.knows("new") && disk.knows("non-audio"),
+              "new discovery persisted for the next process");
+    }
+
+    {
+        const auto file = directory.getChildFile("partial.json");
+        GmailClient::DiscoveryIndex seed;
+        seed.account = "first@example.com";
+        seed.messages.push_back({ "known", "Sender", "Old", {
+            { "known", "audio", "old.wav", "Sender", "Old" } } });
+        check(seed.save(file), "partial-sync fixture saved");
+        {
+            GmailClient client(file);
+            client.state = GmailClient::State::connected;
+            client.unverifiedAccessToken = "offline-test-token";
+            client.worker->testRequest = [&](const juce::URL& url)
+            {
+                const auto address = url.toString(true);
+                if (address.endsWith("/profile"))
+                    return Worker::Response { 200, {}, R"({"emailAddress":"first@example.com"})" };
+                if (address.contains("/messages?"))
+                    return Worker::Response { 200, {}, R"({"messages":[{"id":"fresh"},{"id":"empty"},{"id":"failure"}]})" };
+                if (address.contains("/messages/fresh?"))
+                    return Worker::Response { 200, {},
+                        R"({"payload":{"parts":[{"filename":"fresh.wav","body":{"attachmentId":"fresh-audio"}}]}})" };
+                if (address.contains("/messages/empty?"))
+                    return Worker::Response { 200, {}, R"({"payload":{"parts":[]}})" };
+                return Worker::Response { 403, {},
+                    R"({"error":{"errors":[{"reason":"dailyLimitExceeded"}],"message":"Total Query Cost"}})" };
+            };
+            bool completed = false;
+            client.fetchRecentAudioAttachments(100, [&](const GmailClient::LibraryUpdate& update)
+            {
+                check(update.error.isNotEmpty() && update.attachments.size() == 2
+                      && update.nextSyncDelayMs >= 59000, "partial library retained and retry follows cooldown");
+                completed = true;
+            });
+            check(pumpUntil([&] { return completed; }), "partial failure completes");
+        }
+        GmailClient::DiscoveryIndex disk;
+        check(disk.load(file) && disk.knows("known") && disk.knows("fresh") && disk.knows("empty")
+              && !disk.knows("failure"), "successful partial progress including non-audio survives shutdown");
+        GmailClient restarted(file);
+        restarted.state = GmailClient::State::connected;
+        restarted.unverifiedAccessToken = "offline-test-token";
+        std::atomic<int> details { 0 };
+        restarted.worker->testRequest = [&](const juce::URL& url)
+        {
+            const auto address = url.toString(true);
+            if (address.endsWith("/profile"))
+                return Worker::Response { 200, {}, R"({"emailAddress":"first@example.com"})" };
+            if (address.contains("/messages?"))
+                return Worker::Response { 200, {},
+                    R"({"messages":[{"id":"known"},{"id":"fresh"},{"id":"empty"},{"id":"failure"}]})" };
+            ++details;
+            check(address.contains("/messages/failure?"), "restart fetches only the previously failed message");
+            return Worker::Response { 200, {}, R"({"payload":{}})" };
+        };
+        bool completed = false;
+        restarted.fetchRecentAudioAttachments(100, [&](const GmailClient::LibraryUpdate& update)
+        {
+            check(update.error.isEmpty() && update.attachments.size() == 2, "partial-sync recovery retains library");
+            completed = true;
+        });
+        check(pumpUntil([&] { return completed; }) && details == 1, "partial progress reused after restart");
+    }
+
+    {
+        const auto file = directory.getChildFile("accounts.json");
+        GmailClient::DiscoveryIndex seed;
+        seed.account = "first@example.com";
+        seed.messages.push_back({ "shared-id", "First", "Old account", {
+            { "shared-id", "old", "old.wav", "First", "Old account" } } });
+        check(seed.save(file), "account separation fixture saved");
+        GmailClient client(file);
+        client.state = GmailClient::State::connected;
+        client.unverifiedAccessToken = "second-account-token";
+        std::atomic<int> requests { 0 }, details { 0 };
+        bool profileUnavailable = true;
+        client.worker->testRequest = [&](const juce::URL& url)
+        {
+            ++requests;
+            const auto address = url.toString(true);
+            if (address.endsWith("/profile"))
+                return profileUnavailable ? Worker::Response { 403, {},
+                    R"({"error":{"errors":[{"reason":"dailyLimitExceeded"}],"message":"Total Query Cost"}})" }
+                    : Worker::Response { 200, {}, R"({"emailAddress":"second@example.com"})" };
+            if (address.contains("/messages?"))
+                return Worker::Response { 200, {}, R"({"messages":[{"id":"shared-id"}]})" };
+            ++details;
+            return Worker::Response { 200, {},
+                R"({"payload":{"parts":[{"filename":"second.wav","body":{"attachmentId":"second"}}]}})" };
+        };
+        int completed = 0;
+        const auto paused = [&](const GmailClient::LibraryUpdate& update)
+        {
+            check(!update.accountVerified && update.account == "first@example.com"
+                  && update.attachments.size() == 1 && update.nextSyncDelayMs >= 59000
+                  && client.accessToken.isEmpty(), "unverified account keeps offline rows without enabling uncached audio");
+            ++completed;
+        };
+        client.fetchRecentAudioAttachments(100, paused);
+        check(pumpUntil([&] { return completed == 1; }), "profile quota failure completes");
+        client.fetchRecentAudioAttachments(100, paused);
+        check(pumpUntil([&] { return completed == 2; }) && requests == 1,
+              "cooldown prevents profile and discovery HTTP on early retry");
+        // Change worker state on its own thread, without waiting a real minute.
+        client.worker->enqueue({ {}, Priority::preview, client.getSessionGeneration(), [&](Worker& background)
+        {
+            background.cooldownUntil = 0;
+            profileUnavailable = false;
+        }, {} });
+        client.fetchRecentAudioAttachments(100, [&](const GmailClient::LibraryUpdate& update)
+        {
+            check(update.accountVerified && update.account == "second@example.com"
+                  && update.attachments.size() == 1 && update.attachments[0].filename == "second.wav",
+                  "authenticated account switch replaces rather than merges rows");
+            ++completed;
+        });
+        check(pumpUntil([&] { return completed == 3; }) && details == 1,
+              "known IDs from another account do not suppress discovery");
+        GmailClient::DiscoveryIndex disk;
+        check(disk.load(file) && disk.account == "second@example.com"
+              && disk.attachments().size() == 1 && disk.attachments()[0].attachmentId == "second",
+              "persisted account metadata contains no old-account attachments");
     }
 
     {
