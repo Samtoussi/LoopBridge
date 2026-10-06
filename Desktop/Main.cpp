@@ -2,6 +2,7 @@
 
 #include "GmailClient.h"
 #include "LoopItem.h"
+#include "LibraryFilter.h"
 #include "MetadataParser.h"
 #include "PreviewRenderer.h"
 
@@ -33,15 +34,16 @@ public:
               DocumentWindow::allButtons)
     {
         setUsingNativeTitleBar(true);
-        setResizable(false, false);
+        setResizable(true, false);
+        setResizeLimits(600, 660, 1400, 1400);
 
         setContentOwned(
             new MainComponent(),
             true);
 
         centreWithSize(
-            900,
-            800);
+            760,
+            900);
 
         setVisible(true);
     }
@@ -54,15 +56,122 @@ public:
     }
 
 private:
+    class CompactLookAndFeel : public juce::LookAndFeel_V4
+    {
+    public:
+        CompactLookAndFeel()
+        {
+            const auto surface = juce::Colour::fromRGB(29, 32, 38);
+            const auto text = juce::Colour::fromRGB(226, 229, 234);
+            const auto border = juce::Colour::fromRGB(49, 54, 63);
+            const auto accent = juce::Colour::fromRGB(139, 179, 166);
+            setColour(juce::TextButton::buttonColourId, surface);
+            setColour(juce::TextButton::buttonOnColourId, juce::Colour::fromRGB(46, 62, 59));
+            setColour(juce::TextButton::textColourOffId, text);
+            setColour(juce::TextButton::textColourOnId, text);
+            setColour(juce::ToggleButton::textColourId, text);
+            setColour(juce::ToggleButton::tickColourId, accent);
+            setColour(juce::ToggleButton::tickDisabledColourId, border);
+            setColour(juce::ComboBox::backgroundColourId, surface);
+            setColour(juce::ComboBox::textColourId, text);
+            setColour(juce::ComboBox::outlineColourId, juce::Colours::transparentBlack);
+            setColour(juce::ComboBox::arrowColourId, text.withAlpha(0.6f));
+            setColour(juce::PopupMenu::backgroundColourId, surface);
+            setColour(juce::PopupMenu::textColourId, text);
+            setColour(juce::PopupMenu::highlightedBackgroundColourId, border);
+            setColour(juce::PopupMenu::highlightedTextColourId, text);
+            setColour(juce::Slider::backgroundColourId, border);
+            setColour(juce::Slider::trackColourId, accent);
+            setColour(juce::Slider::thumbColourId, accent);
+            setColour(juce::Slider::textBoxTextColourId, text.withAlpha(0.7f));
+            setColour(juce::Slider::textBoxBackgroundColourId, juce::Colours::transparentBlack);
+            setColour(juce::Slider::textBoxOutlineColourId, juce::Colours::transparentBlack);
+            setColour(juce::TextEditor::backgroundColourId, surface);
+            setColour(juce::TextEditor::textColourId, text);
+            setColour(juce::TextEditor::outlineColourId, juce::Colours::transparentBlack);
+            setColour(juce::TextEditor::focusedOutlineColourId, accent);
+            setColour(juce::ScrollBar::backgroundColourId, juce::Colours::transparentBlack);
+            setColour(juce::ScrollBar::thumbColourId, border.brighter(0.2f));
+            setColour(juce::TooltipWindow::backgroundColourId, surface);
+            setColour(juce::TooltipWindow::textColourId, text);
+            setColour(juce::TooltipWindow::outlineColourId, border);
+        }
+
+        juce::Font getTextButtonFont(juce::TextButton&, int) override
+        {
+            return juce::Font(juce::FontOptions(12.0f));
+        }
+        juce::Font getComboBoxFont(juce::ComboBox&) override
+        {
+            return juce::Font(juce::FontOptions(12.0f));
+        }
+        juce::Font getLabelFont(juce::Label&) override
+        {
+            return juce::Font(juce::FontOptions(12.0f));
+        }
+        bool areScrollbarButtonsVisible() override { return false; }
+        void drawButtonText(juce::Graphics& g, juce::TextButton& button, bool over, bool down) override
+        {
+            if (button.getName() != "transport")
+            {
+                juce::LookAndFeel_V4::drawButtonText(g, button, over, down);
+                return;
+            }
+            g.setColour(button.findColour(juce::TextButton::textColourOffId)
+                .withAlpha(button.isEnabled() ? 1.0f : 0.35f));
+            const float x = button.getWidth() * 0.5f, y = button.getHeight() * 0.5f;
+            if (button.getButtonText() == "Pause")
+            {
+                g.fillRoundedRectangle(x - 6, y - 6, 4, 12, 1);
+                g.fillRoundedRectangle(x + 2, y - 6, 4, 12, 1);
+            }
+            else if (button.getButtonText() == "Cancel")
+            {
+                g.drawLine(x - 5, y - 5, x + 5, y + 5, 1.5f);
+                g.drawLine(x - 5, y + 5, x + 5, y - 5, 1.5f);
+            }
+            else
+            {
+                juce::Path triangle;
+                triangle.addTriangle(x - 4, y - 7, x - 4, y + 7, x + 7, y);
+                g.fillPath(triangle);
+            }
+        }
+        void drawButtonBackground(juce::Graphics& g, juce::Button& button,
+                                  const juce::Colour& colour, bool over, bool down) override
+        {
+            const auto bounds = button.getLocalBounds().toFloat().reduced(0.5f);
+            if (button.getName() == "tab")
+            {
+                if (button.getToggleState())
+                {
+                    g.setColour(button.findColour(juce::TextButton::textColourOnId).withAlpha(0.65f));
+                    g.fillRoundedRectangle(bounds.getX() + 10.0f, bounds.getBottom() - 2.0f,
+                                           bounds.getWidth() - 20.0f, 2.0f, 1.0f);
+                }
+                return;
+            }
+            const bool quiet = button.getName() != "transport" && !button.getToggleState();
+            auto fill = button.getToggleState() ? button.findColour(juce::TextButton::buttonOnColourId) : colour;
+            if (over || down) fill = fill.brighter(down ? 0.15f : 0.08f);
+            g.setColour(fill.withAlpha(button.isEnabled() ? (quiet && !over && !down ? 0.0f : 1.0f) : 0.35f));
+            g.fillRoundedRectangle(bounds, 4.0f);
+        }
+    };
+
     class MainComponent
         : public juce::AudioAppComponent,
-          private juce::Timer
+          public juce::TooltipClient,
+          private juce::Timer,
+          private juce::ScrollBar::Listener
     {
     public:
         MainComponent()
             : receiveSocket(false),
               sendSocket(false)
         {
+            setLookAndFeel(&lookAndFeel);
+            tooltips.setLookAndFeel(&lookAndFeel);
             listening =
                 receiveSocket.bindToPort(
                     49152,
@@ -74,19 +183,71 @@ private:
             setWantsKeyboardFocus(true);
 
             loadButton.setButtonText(
-                "Load 100 BPM WAV");
+                "Open...");
+            loadButton.setTooltip("Open a local 100 BPM / 4-bar WAV");
+            bridgeButton.setName("service");
+            gmailButton.setName("service");
+            bridgeButton.setTooltip("Toggle Bridge ON/OFF: FL Studio preview or local solo preview");
+            gmailButton.setTooltip("Connect or disconnect Gmail; known cached loops remain available offline");
+            for (auto* button : { &loadButton, &playButton, &stopButton, &bridgeButton, &gmailButton })
+                button->setWantsKeyboardFocus(false);
+
+            allTab.setButtonText("All");
+            allTab.setName("tab");
+            allTab.setToggleState(true, juce::dontSendNotification);
+            allTab.setWantsKeyboardFocus(false);
+            favoritesTab.setButtonText("Favorites");
+            favoritesTab.setName("tab");
+            favoritesTab.setTooltip("Loops from favorite producers");
+            searchField.setFont(juce::Font(juce::FontOptions(12.0f)));
+            searchField.setTextToShowWhenEmpty("Search loops or producers...", juce::Colour::fromRGB(139, 145, 155));
+            searchField.setTooltip("Search loop filenames and producers");
+            searchField.onTextChange = [this] { rebuildVisibleLibrary(true); };
+            searchField.onReturnKey = [this] { grabKeyboardFocus(); };
+            allTab.onClick = [this] { favoritesOnly = false; rebuildVisibleLibrary(true); grabKeyboardFocus(); };
+            favoritesTab.onClick = [this] { favoritesOnly = true; rebuildVisibleLibrary(true); grabKeyboardFocus(); };
+            addAndMakeVisible(allTab);
+            addAndMakeVisible(favoritesTab);
+            addAndMakeVisible(searchField);
+            detailsButton.setButtonText("...");
+            detailsButton.setName("service");
+            detailsButton.setWantsKeyboardFocus(false);
+            detailsButton.setTooltip("Connection details and diagnostics");
+            detailsButton.onClick = [this]
+            {
+                juce::PopupMenu menu;
+                menu.addItem(1, "Open local audio...");
+                menu.addItem(2, "Stop preview", stopButton.isEnabled());
+                menu.addSeparator();
+                menu.addItem(3, "Connection details and diagnostics...");
+                const juce::Component::SafePointer<MainComponent> safe(this);
+                menu.showMenuAsync(juce::PopupMenu::Options().withTargetComponent(&detailsButton),
+                    [safe](int result)
+                    {
+                        if (safe == nullptr) return;
+                        if (result == 1) safe->loadButton.triggerClick();
+                        else if (result == 2) safe->stopButton.triggerClick();
+                        else if (result == 3) safe->showDiagnostics();
+                    });
+            };
+            addAndMakeVisible(detailsButton);
+            browserScrollbar.setSingleStepSize(1.0);
+            browserScrollbar.addListener(this);
+            addAndMakeVisible(browserScrollbar);
 
             playButton.setButtonText(
                 "Play");
+            playButton.setName("transport");
 
             stopButton.setButtonText(
                 "Stop");
 
             bridgeButton.setButtonText(
                 "BRIDGE ON");
+            bridgeButton.setToggleState(bridgeEnabled, juce::dontSendNotification);
 
             gmailButton.setButtonText(
-                "CONNECT GMAIL");
+                "Gmail");
 
             addAndMakeVisible(
                 loadButton);
@@ -107,7 +268,7 @@ private:
             volumeSlider.setValue(100.0, juce::dontSendNotification);
             volumeSlider.setTextValueSuffix("%");
             volumeSlider.setSliderStyle(juce::Slider::LinearHorizontal);
-            volumeSlider.setTextBoxStyle(juce::Slider::TextBoxRight, false, 65, 24);
+            volumeSlider.setTextBoxStyle(juce::Slider::NoTextBox, false, 0, 0);
             volumeSlider.setName("Preview volume");
             volumeSlider.setTooltip("Preview volume");
             volumeSlider.onValueChange = [this]
@@ -124,6 +285,10 @@ private:
             options.filenameSuffix = ".settings";
             options.osxLibrarySubFolder = "Application Support";
             settings = std::make_unique<juce::PropertiesFile>(options);
+            const auto savedFavorites = juce::JSON::parse(settings->getValue("favoriteProducers"));
+            if (const auto saved = savedFavorites.getArray())
+                for (const auto& name : *saved)
+                    favoriteProducers.insert(LibraryFilter::normalizeProducer(name.toString()));
             projectKeyId = juce::jlimit(1, 24, settings->getIntValue("projectKey", 1));
             const char* notes[] = { "C", "C#/Db", "D", "D#/Eb", "E", "F", "F#/Gb", "G", "G#/Ab", "A", "A#/Bb", "B" };
             for (int mode = 0; mode < 2; ++mode)
@@ -131,6 +296,9 @@ private:
                     projectKeySelector.addItem(juce::String(notes[note]) + (mode ? " minor" : " major"), mode * 12 + note + 1);
             projectKeySelector.setSelectedId(projectKeyId, juce::dontSendNotification);
             projectKeySelector.setTooltip("Project key");
+            keySyncButton.setTooltip("Match the loop key to the project key");
+            pitchMinus.setTooltip("Lower manual transpose by one semitone");
+            pitchPlus.setTooltip("Raise manual transpose by one semitone");
             keySyncButton.setButtonText("Key Sync");
             keySyncButton.setToggleState(settings->getBoolValue("keySync", false), juce::dontSendNotification);
             pitchMinus.setButtonText("-");
@@ -152,7 +320,7 @@ private:
             addAndMakeVisible(pitchMinus);
             addAndMakeVisible(pitchPlus);
             addAndMakeVisible(pitchLabel);
-            addAndMakeVisible(keyStatusLabel);
+            addChildComponent(keyStatusLabel);
             updatePitchControls();
 
             playButton.setEnabled(false);
@@ -210,6 +378,7 @@ private:
                         bridgeEnabled
                             ? "BRIDGE ON"
                             : "BRIDGE OFF");
+                    bridgeButton.setToggleState(bridgeEnabled, juce::dontSendNotification);
 
                     rebuildSoloBuffer();
                     sendBridgeState();
@@ -236,7 +405,7 @@ private:
                         loadedBrowserLoopIndex = -1;
 
                         gmailButton.setButtonText(
-                            "CONNECT GMAIL");
+                            "Gmail");
 
                         gmailStatus =
                             "GMAIL: NOT CONNECTED";
@@ -271,7 +440,7 @@ private:
                                 == GmailClient::State::connected)
                             {
                                 gmailButton.setButtonText(
-                                    "DISCONNECT GMAIL");
+                                    "Gmail");
 
                                 gmailStatus =
                                     "GMAIL: CONNECTED";
@@ -282,7 +451,7 @@ private:
                                      == GmailClient::State::authorizing)
                             {
                                 gmailButton.setButtonText(
-                                    "CONNECTING...");
+                                    "Gmail connecting");
 
                                 gmailStatus =
                                     "GMAIL: "
@@ -292,7 +461,7 @@ private:
                                      == GmailClient::State::error)
                             {
                                 gmailButton.setButtonText(
-                                    "CONNECT GMAIL");
+                                    "Gmail");
 
                                 gmailStatus =
                                     "GMAIL ERROR: "
@@ -301,7 +470,7 @@ private:
                             else
                             {
                                 gmailButton.setButtonText(
-                                    "CONNECT GMAIL");
+                                    "Gmail");
 
                                 gmailStatus =
                                     "GMAIL: NOT CONNECTED";
@@ -331,6 +500,8 @@ private:
 
         ~MainComponent() override
         {
+            setLookAndFeel(nullptr);
+            tooltips.setLookAndFeel(nullptr);
             stopTimer();
             gmailClient.shutdown();
 
@@ -456,37 +627,22 @@ private:
         bool keyPressed(
             const juce::KeyPress& key) override
         {
-            if (loopItems.empty())
-                return false;
-
-            if (key == juce::KeyPress::downKey)
+            if (visibleLoopIndices.empty()) return false;
+            const int current = selectedVisibleRow();
+            if (key == juce::KeyPress::downKey || key == juce::KeyPress::upKey)
             {
-                selectLoop(std::min(
-                    selectedLoopIndex + 1,
-                    static_cast<int>(loopItems.size()) - 1));
+                const int row = current < 0 ? 0 : juce::jlimit(0, static_cast<int>(visibleLoopIndices.size()) - 1,
+                    current + (key == juce::KeyPress::downKey ? 1 : -1));
+                selectLoop(visibleItem(row));
                 previewSelectedLoop();
                 return true;
             }
-
-            if (key == juce::KeyPress::upKey)
+            if (key == juce::KeyPress::homeKey || key == juce::KeyPress::endKey)
             {
-                selectLoop(std::max(selectedLoopIndex - 1, 0));
-                previewSelectedLoop();
+                selectLoop(visibleItem(key == juce::KeyPress::homeKey ? 0 : static_cast<int>(visibleLoopIndices.size()) - 1));
                 return true;
             }
-
-            if (key == juce::KeyPress::homeKey)
-            {
-                selectLoop(0);
-                return true;
-            }
-
-            if (key == juce::KeyPress::endKey)
-            {
-                selectLoop(static_cast<int>(loopItems.size()) - 1);
-                return true;
-            }
-
+            if (current < 0) return false;
             if (key.getKeyCode() == ' ')
             {
                 toggleSelectedLoopPreview();
@@ -517,11 +673,7 @@ private:
                 browserTop
                 + browserHeaderHeight;
 
-            if (event.y < rowsTop
-                || event.y
-                       >= rowsTop
-                              + browserVisibleRows
-                                    * browserRowHeight)
+            if (!getBrowserRowsBounds().contains(event.getPosition()))
             {
                 grabKeyboardFocus();
                 return;
@@ -532,19 +684,24 @@ private:
                 / browserRowHeight;
 
             const int itemIndex =
-                browserScrollIndex
-                + visibleRow;
+                visibleItem(browserScrollIndex + visibleRow);
 
             if (itemIndex >= 0
                 && itemIndex
                        < static_cast<int>(
                            loopItems.size()))
             {
+                const int favoriteLeft = getBrowserColumns().favorite;
+                if (event.x >= favoriteLeft && event.x < favoriteLeft + 30)
+                {
+                    toggleProducerFavorite(itemIndex);
+                    grabKeyboardFocus();
+                    return;
+                }
                 selectLoop(itemIndex);
 
                 const int downloadLeft =
-                    browserLeft + getWidth()
-                    - browserLeft * 2 - 42;
+                    getBrowserColumns().download;
 
                 if (event.x >= downloadLeft
                     && event.x < downloadLeft + 30)
@@ -555,7 +712,7 @@ private:
                 }
 
                 const int playButtonLeft =
-                    browserLeft + 10;
+                    getBrowserColumns().play;
 
                 const int playButtonRight =
                     playButtonLeft + 28;
@@ -635,7 +792,7 @@ private:
                 std::max(
                     0,
                     static_cast<int>(
-                        loopItems.size())
+                        visibleLoopIndices.size())
                         - browserVisibleRows);
 
             if (maxScroll <= 0)
@@ -672,11 +829,7 @@ private:
                 browserTop
                 + browserHeaderHeight;
 
-            if (event.y < rowsTop
-                || event.y
-                       >= rowsTop
-                              + browserVisibleRows
-                                    * browserRowHeight)
+            if (!getBrowserRowsBounds().contains(event.getPosition()))
             {
                 return;
             }
@@ -686,8 +839,7 @@ private:
                 / browserRowHeight;
 
             const int itemIndex =
-                browserScrollIndex
-                + visibleRow;
+                visibleItem(browserScrollIndex + visibleRow);
 
             if (itemIndex < 0
                 || itemIndex
@@ -698,484 +850,197 @@ private:
             }
 
             const int downloadLeft =
-                browserLeft + getWidth()
-                - browserLeft * 2 - 42;
+                getBrowserColumns().download;
 
             if (event.x >= downloadLeft
                 && event.x < downloadLeft + 30)
                 return;
 
-            selectLoop(
-                itemIndex);
+            if (event.x >= getBrowserColumns().favorite && event.x < getBrowserColumns().favorite + 30) return;
+            selectLoop(itemIndex);
 
             loadSelectedGmailLoop();
 
             grabKeyboardFocus();
         }
 
-        void paint(
-            juce::Graphics& g) override
+        void paint(juce::Graphics& g) override
         {
-            g.fillAll(
-                juce::Colour::fromRGB(
-                    20,
-                    20,
-                    24));
+            const auto text = juce::Colour::fromRGB(226, 229, 234);
+            const auto muted = juce::Colour::fromRGB(139, 145, 155);
+            const auto accent = juce::Colour::fromRGB(139, 179, 166);
+            const auto warning = juce::Colour::fromRGB(218, 169, 112);
+            g.fillAll(juce::Colour::fromRGB(19, 21, 25));
+            g.setColour(text);
+            g.setFont(juce::Font(juce::FontOptions(14.0f, juce::Font::bold)));
+            g.drawText("LOOPBRIDGE", 16, 8, 140, 28, juce::Justification::centredLeft);
 
-            g.setColour(
-                juce::Colours::white);
+            const bool gmailAttention = gmailStatus.containsIgnoreCase("ERROR")
+                || gmailStatus.containsIgnoreCase("PAUSED");
+            g.setColour(gmailAttention ? warning : gmailClient.getState() == GmailClient::State::connected
+                ? accent : muted);
+            g.fillEllipse(static_cast<float>(gmailButton.getX() - 8), 19.0f, 5.0f, 5.0f);
+            g.setColour(juce::Colour::fromRGB(39, 43, 50));
+            // Surface spacing separates the header without a divider.
 
-            g.setFont(
-                juce::Font(
-                    juce::FontOptions(
-                        32.0f,
-                        juce::Font::bold)));
+            drawLoopBrowser(g);
 
-            g.drawFittedText(
-                "LOOPBRIDGE",
-                0,
-                20,
-                getWidth(),
-                45,
-                juce::Justification::centred,
-                1);
-
-            g.setFont(
-                juce::Font(
-                    juce::FontOptions(
-                        15.0f)));
-
-            g.setColour(
-                listening
-                    ? juce::Colours::lightgreen
-                    : juce::Colours::red);
-
-            g.drawFittedText(
-                listening
-                    ? "LISTENING"
-                    : "PORT ERROR",
-                0,
-                67,
-                getWidth(),
-                25,
-                juce::Justification::centred,
-                1);
-
-            g.setColour(
-                juce::Colours::white);
-
-            g.setFont(
-                juce::Font(
-                    juce::FontOptions(
-                        38.0f,
-                        juce::Font::bold)));
-
-            const auto bpmText =
-                hostBpm > 0.0
-                    ? juce::String(
-                          hostBpm,
-                          2)
-                    : "--";
-
-            g.drawFittedText(
-                bpmText,
-                0,
-                95,
-                getWidth(),
-                50,
-                juce::Justification::centred,
-                1);
-
-            g.setColour(
-                juce::Colours::white
-                    .withAlpha(0.55f));
-
-            g.setFont(
-                juce::Font(
-                    juce::FontOptions(
-                        14.0f)));
-
-            g.drawFittedText(
-                "HOST BPM",
-                0,
-                140,
-                getWidth(),
-                22,
-                juce::Justification::centred,
-                1);
-
-            g.setColour(
-                hostPlaying
-                    ? juce::Colours::lightgreen
-                    : juce::Colours::white
-                          .withAlpha(0.55f));
-
-            g.setFont(
-                juce::Font(
-                    juce::FontOptions(
-                        14.0f,
-                        juce::Font::bold)));
-
-            g.drawFittedText(
-                hostPlaying
-                    ? "FL PLAYING"
-                    : "FL STOPPED",
-                0,
-                170,
-                getWidth(),
-                25,
-                juce::Justification::centred,
-                1);
-
-            g.setColour(
-                juce::Colours::white
-                    .withAlpha(0.75f));
-
-            g.setFont(
-                juce::Font(
-                    juce::FontOptions(
-                        14.0f)));
-
-            g.drawFittedText(
-                "PPQ: "
-                    + juce::String(
-                        getEstimatedPpq(),
-                        3),
-                0,
-                198,
-                getWidth(),
-                22,
-                juce::Justification::centred,
-                1);
-
-            juce::String sourceText =
-                sourceBpm > 0.0
-                    ? "SOURCE: "
-                          + juce::String(sourceBpm, 0)
-                          + " BPM / 4 BARS"
-                    : "SOURCE: BPM UNKNOWN / 4 BARS";
-
-            if (hostBpm > 0.0)
+            const int playerTop = getHeight() - playerHeight;
+            g.setColour(juce::Colour::fromRGB(24, 27, 32));
+            g.fillRect(0, playerTop, getWidth(), playerHeight);
+            g.setColour(juce::Colour::fromRGB(49, 54, 63));
+            // Read-only progress uses the audio position or the existing host PPQ estimate.
+            g.fillRect(0, playerTop, getWidth(), 2);
+            double progress = -1.0;
+            if (pendingBrowserPreview.isEmpty() && loadedFileName.isNotEmpty())
             {
-                sourceText +=
-                    "  ->  HOST: "
-                    + juce::String(
-                        hostBpm,
-                        0)
-                    + " BPM";
-            }
-
-            g.setColour(
-                juce::Colours::white
-                    .withAlpha(0.65f));
-
-            g.drawFittedText(
-                sourceText,
-                0,
-                225,
-                getWidth(),
-                22,
-                juce::Justification::centred,
-                1);
-
-            g.setColour(
-                juce::Colours::orange);
-
-            g.setFont(
-                juce::Font(
-                    juce::FontOptions(
-                        14.0f,
-                        juce::Font::bold)));
-
-            const juce::String flSrText =
-                hostSampleRate > 0.0
-                    ? juce::String(
-                          hostSampleRate,
-                          0)
-                          + " Hz"
-                    : "--";
-
-            const juce::String fileSrText =
-                sourceSampleRate > 0.0
-                    ? juce::String(
-                          sourceSampleRate,
-                          0)
-                          + " Hz"
-                    : "--";
-
-            const juce::String deviceSrText =
-                deviceSampleRate > 0.0
-                    ? juce::String(
-                          deviceSampleRate.load(),
-                          0)
-                          + " Hz"
-                    : "--";
-
-            g.drawFittedText(
-                "FL SR: "
-                    + flSrText
-                    + "   |   FILE SR: "
-                    + fileSrText
-                    + "   |   DEVICE SR: "
-                    + deviceSrText,
-                15,
-                255,
-                getWidth() - 30,
-                25,
-                juce::Justification::centred,
-                1);
-
-            g.setFont(
-                juce::Font(
-                    juce::FontOptions(
-                        13.0f,
-                        juce::Font::bold)));
-
-            if (bridgeEnabled && !isHostConnected())
-            {
-                g.setColour(juce::Colours::orange);
-                g.drawFittedText("BRIDGE DISCONNECTED / WAITING FOR VST",
-                    0, 287, getWidth(), 22, juce::Justification::centred, 1);
-            }
-            else if (renderError.isNotEmpty())
-            {
-                g.setColour(juce::Colours::orange);
-                g.drawFittedText(renderError, 0, 287, getWidth(), 22, juce::Justification::centred, 1);
-            }
-            else if (stretching)
-            {
-                g.setColour(
-                    juce::Colours::orange);
-
-                g.drawFittedText(
-                    "PREPARING PREVIEW...",
-                    0,
-                    287,
-                    getWidth(),
-                    22,
-                    juce::Justification::centred,
-                    1);
-            }
-            else if (soloPlaying)
-            {
-                g.setColour(
-                    juce::Colours::lightgreen);
-
-                g.drawFittedText(
-                    sourceBpm > 0.0
-                        ? "SOLO PREVIEW / ORIGINAL "
-                              + juce::String(sourceBpm, 0)
-                              + " BPM"
-                        : "SOLO PREVIEW / BPM UNKNOWN",
-                    0,
-                    287,
-                    getWidth(),
-                    22,
-                    juce::Justification::centred,
-                    1);
-            }
-            else if (bridgeEnabled)
-            {
-                g.setColour(
-                    bridgeEnabled
-                        ? juce::Colours::lightgreen
-                        : juce::Colours::white
-                              .withAlpha(0.55f));
-
-                g.drawFittedText(
-                    !isHostConnected() ? "BRIDGE DISCONNECTED / WAITING FOR VST"
-                        : !hostPreviewEnabled ? "HOST PREVIEW PAUSED"
-                        : !hostPreviewReady ? "WAITING FOR HOST PREVIEW"
-                        : !hostPlaying ? "WAITING FOR FL TRANSPORT"
-                        : "HOST PREVIEW -> FL MIXER",
-                    0,
-                    287,
-                    getWidth(),
-                    22,
-                    juce::Justification::centred,
-                    1);
-            }
-
-            g.setColour(
-                juce::Colours::white
-                    .withAlpha(0.75f));
-
-            g.setFont(
-                juce::Font(
-                    juce::FontOptions(
-                        14.0f)));
-
-            const juce::String fileText =
-                loadedFileName.isEmpty()
-                    ? "No audio file loaded"
-                    : loadedFileName;
-
-            g.drawFittedText(
-                fileText,
-                30,
-                320,
-                getWidth() - 60,
-                30,
-                juce::Justification::centred,
-                1);
-
-            if (sourceTotalSamples > 0
-                && sourceSampleRate > 0.0)
-            {
-                const double fileSeconds =
-                    sourceTotalSamples
-                    / sourceSampleRate;
-
-                juce::String lengthText =
-                    "File: "
-                    + juce::String(
-                        fileSeconds,
-                        3)
-                    + "s";
-
-                if (sourceBpm > 0.0)
+                if (bridgeEnabled)
                 {
-                    const double musicalSeconds =
-                        loopBeats
-                        * 60.0
-                        / sourceBpm;
-
-                    lengthText +=
-                        " / Musical: "
-                        + juce::String(
-                            musicalSeconds,
-                            3)
-                        + "s";
+                    if (isHostConnected() && hostPreviewReady && hostPreviewEnabled)
+                    {
+                        double phase = std::fmod(getEstimatedPpq(), loopBeats);
+                        if (phase < 0.0) phase += loopBeats;
+                        progress = phase / loopBeats;
+                    }
                 }
                 else
                 {
-                    lengthText +=
-                        " / Musical: BPM unknown";
+                    const juce::ScopedTryLock lock(audioLock);
+                    if (lock.isLocked() && soloPreviewReady && soloBuffer && soloBuffer->getNumSamples() > 0)
+                        progress = static_cast<double>(soloPlaybackPosition) / soloBuffer->getNumSamples();
                 }
-
-                if (hostPreviewBuffer && hostPreviewBuffer->getNumSamples() > 0
-                    && stretchedForHostSampleRate
-                           > 0.0)
-                {
-                    const double
-                        stretchedSeconds =
-                            hostPreviewBuffer->getNumSamples()
-                            / stretchedForHostSampleRate;
-
-                    lengthText +=
-                        " -> "
-                        + juce::String(
-                            stretchedSeconds,
-                            3)
-                        + "s";
-                }
-
-                g.setColour(
-                    juce::Colours::white
-                        .withAlpha(0.5f));
-
-                g.drawFittedText(
-                    lengthText,
-                    0,
-                    350,
-                    getWidth(),
-                    22,
-                    juce::Justification::centred,
-                    1);
+            }
+            if (progress >= 0.0)
+            {
+                const float position = static_cast<float>(juce::jlimit(0.0, 1.0, progress) * getWidth());
+                g.setColour(accent.withAlpha(0.7f));
+                g.fillRect(0.0f, static_cast<float>(playerTop), position, 2.0f);
+                g.fillEllipse(juce::jlimit(0.0f, static_cast<float>(getWidth() - 4), position - 2),
+                              static_cast<float>(playerTop), 4.0f, 4.0f);
             }
 
-            g.setColour(
-                gmailClient.getState()
-                        == GmailClient::State::connected
-                    ? juce::Colours::lightgreen
-                    : juce::Colours::white
-                          .withAlpha(0.55f));
-
-            g.setFont(
-                juce::Font(
-                    juce::FontOptions(
-                        12.0f,
-                        juce::Font::bold)));
-
-            g.drawFittedText(
-                gmailStatus,
-                20,
-                378,
-                getWidth() - 40,
-                20,
-                juce::Justification::centred,
-                1);
-
-            drawLoopBrowser(
-                g);
+            // Display the pending or loaded source, not an unrelated highlighted row.
+            const LoopItem* playerItem = nullptr;
+            const auto playerIdentity = pendingBrowserPreview.isNotEmpty() ? pendingBrowserPreview : originalPreviewIdentity;
+            if (playerIdentity.isNotEmpty())
+                for (const auto& item : loopItems)
+                    if (getLoopCacheKey(item) == playerIdentity) { playerItem = &item; break; }
+            const bool pending = pendingBrowserPreview.isNotEmpty();
+            const bool hasSource = pending || loadedFileName.isNotEmpty();
+            const auto title = playerItem != nullptr ? playerItem->filename
+                : loadedFileName.isNotEmpty() ? loadedFileName : juce::String("Select a loop");
+            const int metadataWidth = getWidth() - 248;
+            g.setColour(text);
+            g.setFont(juce::Font(juce::FontOptions(hasSource ? 14.0f : 13.0f, juce::Font::bold)));
+            g.drawText(title, 100, playerTop + 8, metadataWidth, 22, juce::Justification::centredLeft);
+            if (hasSource)
+            {
+                juce::String metadata = playerItem != nullptr ? getSenderDisplayName(*playerItem) : "Local file";
+                const double bpm = pending && playerItem != nullptr ? playerItem->bpm.value_or(0.0) : sourceBpm;
+                if (bpm > 0.0) metadata += juce::String::fromUTF8(" \xC2\xB7 ") + juce::String(bpm, 0) + " BPM";
+                if (playerItem != nullptr && playerItem->key.isNotEmpty())
+                    metadata += juce::String::fromUTF8(" \xC2\xB7 ") + playerItem->key;
+                g.setColour(muted);
+                g.setFont(juce::Font(juce::FontOptions(11.5f)));
+                g.drawText(metadata, 100, playerTop + 30, metadataWidth, 18, juce::Justification::centredLeft);
+            }
+            // A speaker identifies volume without a caption or numeric control box.
+            g.setColour(muted);
+            juce::Path speaker;
+            speaker.startNewSubPath(18.0f, static_cast<float>(playerTop + 61));
+            speaker.lineTo(22.0f, static_cast<float>(playerTop + 61));
+            speaker.lineTo(27.0f, static_cast<float>(playerTop + 57));
+            speaker.lineTo(27.0f, static_cast<float>(playerTop + 71));
+            speaker.lineTo(22.0f, static_cast<float>(playerTop + 67));
+            speaker.lineTo(18.0f, static_cast<float>(playerTop + 67));
+            speaker.closeSubPath();
+            g.fillPath(speaker);
+            g.drawLine(31.0f, static_cast<float>(playerTop + 60), 31.0f, static_cast<float>(playerTop + 68), 1.5f);
         }
-
         void resized() override
         {
-            const int buttonWidth =
-                150;
 
-            const int buttonHeight =
-                40;
+            gmailButton.setBounds(getWidth() - 148, 8, 96, 28);
+            detailsButton.setBounds(getWidth() - 44, 8, 28, 28);
+            searchField.setBounds(16, 52, getWidth() - 32, 32);
+            allTab.setBounds(16, 92, 44, 26);
+            favoritesTab.setBounds(66, 92, 78, 26);
+            const int playerTop = getHeight() - playerHeight;
+            playButton.setBounds(16, playerTop + 10, 68, 32);
+            bridgeButton.setBounds(getWidth() - 132, playerTop + 10, 116, 32);
+            stopButton.setVisible(false);
+            loadButton.setVisible(false);
+            const int transposeLeft = getWidth() - 132;
+            projectKeySelector.setBounds(transposeLeft - 142, playerTop + 50, 130, 28);
+            keySyncButton.setBounds(projectKeySelector.getX() - 102, playerTop + 50, 90, 28);
+            volumeSlider.setBounds(38, playerTop + 50, std::min(218, getWidth() - 426), 28);
+            pitchMinus.setBounds(transposeLeft, playerTop + 50, 26, 28);
+            pitchLabel.setBounds(transposeLeft + 28, playerTop + 50, 60, 28);
+            pitchPlus.setBounds(transposeLeft + 90, playerTop + 50, 26, 28);
+            browserVisibleRows = std::max(1, (playerTop - 26 - browserTop - browserHeaderHeight) / browserRowHeight);
+            const int maxScroll = std::max(0, static_cast<int>(visibleLoopIndices.size()) - browserVisibleRows);
+            // Keep the selected row visible when the window height shrinks.
+            if (selectedVisibleRow() >= browserScrollIndex + browserVisibleRows)
+                browserScrollIndex = selectedVisibleRow() - browserVisibleRows + 1;
+            browserScrollIndex = juce::jlimit(0, maxScroll, browserScrollIndex);
+            browserScrollbar.setBounds(getWidth() - browserLeft - 8, browserTop + browserHeaderHeight,
+                                       8, browserVisibleRows * browserRowHeight);
+        }
+        juce::String getTooltip() override
+        {
+            const auto position = getMouseXYRelative();
+            if (!getBrowserRowsBounds().contains(position)) return {};
+            const int index = browserScrollIndex + (position.y - getBrowserRowsBounds().getY()) / browserRowHeight;
+            if (index >= static_cast<int>(visibleLoopIndices.size())) return {};
+            const int actionLeft = getBrowserColumns().download;
+            if (position.x >= actionLeft && position.x < actionLeft + 30) return "Download";
+            if (position.x >= getBrowserColumns().favorite && position.x < getBrowserColumns().favorite + 30) return "Favorite producer";
+            return {};
+        }
+    private:
+        CompactLookAndFeel lookAndFeel;
+        juce::TooltipWindow tooltips { this, 650 };
+        juce::TextEditor searchField;
+        juce::TextButton allTab, favoritesTab, detailsButton;
+        juce::ScrollBar browserScrollbar { true };
+        int displayedScrollStart = -1, displayedScrollRows = -1;
+        std::map<juce::String, bool> downloadIndicators;
+        double downloadIndicatorsUpdatedMs = 0.0;
+        std::vector<int> visibleLoopIndices;
+        std::set<juce::String> favoriteProducers;
+        bool favoritesOnly = false;
 
-            const int gap =
-                12;
-
-            const int totalWidth =
-                buttonWidth * 3
-                + gap * 2;
-
-            const int startX =
-                (getWidth()
-                 - totalWidth)
-                / 2;
-
-            const int y =
-                410;
-
-            loadButton.setBounds(
-                startX,
-                y,
-                buttonWidth,
-                buttonHeight);
-
-            playButton.setBounds(
-                startX
-                    + buttonWidth
-                    + gap,
-                y,
-                buttonWidth,
-                buttonHeight);
-
-            stopButton.setBounds(
-                startX
-                    + (buttonWidth + gap)
-                          * 2,
-                y,
-                buttonWidth,
-                buttonHeight);
-
-            bridgeButton.setBounds(
-                (getWidth() - 180) / 2,
-                460,
-                180,
-                40);
-
-            gmailButton.setBounds(
-                (getWidth() - 180) / 2,
-                510,
-                180,
-                40);
-            volumeSlider.setBounds(15, 460, 235, 40);
-            projectKeySelector.setBounds(35, 553, 175, 28);
-            keySyncButton.setBounds(225, 553, 95, 28);
-            pitchMinus.setBounds(345, 553, 28, 28);
-            pitchLabel.setBounds(377, 553, 95, 28);
-            pitchPlus.setBounds(476, 553, 28, 28);
-            keyStatusLabel.setBounds(525, 553, getWidth() - 550, 28);
+        int visibleItem(int row) const { return LibraryFilter::underlyingIndex(visibleLoopIndices, row); }
+        int selectedVisibleRow() const
+        {
+            const auto found = std::find(visibleLoopIndices.begin(), visibleLoopIndices.end(), selectedLoopIndex);
+            return found == visibleLoopIndices.end() ? -1 : static_cast<int>(found - visibleLoopIndices.begin());
+        }
+        void rebuildVisibleLibrary(bool resetScroll)
+        {
+            visibleLoopIndices = LibraryFilter::visibleItems(loopItems, favoriteProducers, favoritesOnly, searchField.getText());
+            allTab.setToggleState(!favoritesOnly, juce::dontSendNotification);
+            favoritesTab.setToggleState(favoritesOnly, juce::dontSendNotification);
+            dragCandidateIndex = -1;
+            if (resetScroll) browserScrollIndex = 0;
+            browserScrollIndex = juce::jlimit(0, std::max(0, static_cast<int>(visibleLoopIndices.size()) - browserVisibleRows), browserScrollIndex);
+            // Keep selection and pending/active playback identity untouched by filtering.
+            repaint();
+        }
+        void toggleProducerFavorite(int index)
+        {
+            const auto name = LibraryFilter::normalizeProducer(LibraryFilter::producer(loopItems[static_cast<size_t>(index)]));
+            if (name.isEmpty()) return;
+            if (favoriteProducers.count(name)) favoriteProducers.erase(name);
+            else favoriteProducers.insert(name);
+            juce::Array<juce::var> names;
+            for (const auto& favorite : favoriteProducers) names.add(favorite);
+            settings->setValue("favoriteProducers", juce::JSON::toString(juce::var(names)));
+            settings->saveIfNeeded();
+            rebuildVisibleLibrary(false);
         }
 
-    private:
+        static constexpr int playerHeight = 86;
         static constexpr double loopBeats =
             16.0;
 
@@ -1186,19 +1051,81 @@ private:
             ppqDiscontinuityThreshold = 0.25;
 
         static constexpr int
-            browserTop = 590;
+            browserTop = 128;
 
         static constexpr int
-            browserLeft = 40;
+            browserLeft = 16;
 
         static constexpr int
-            browserHeaderHeight = 36;
+            browserHeaderHeight = 0;
 
         static constexpr int
-            browserRowHeight = 32;
+            browserRowHeight = 54;
 
-        static constexpr int
-            browserVisibleRows = 5;
+        int browserVisibleRows = 1;
+
+        struct BrowserColumns
+        {
+            int play, loop, bpm, key, favorite, download;
+        };
+
+        BrowserColumns getBrowserColumns() const
+        {
+            const int width = getWidth() - browserLeft * 2;
+            BrowserColumns columns;
+            columns.play = browserLeft + 10;
+            columns.loop = browserLeft + 46;
+            columns.download = browserLeft + width - 42;
+            columns.favorite = columns.download - 34;
+            columns.key = columns.favorite - 66;
+            columns.bpm = columns.key - 52;
+            return columns;
+        }
+
+        juce::Rectangle<int> getBrowserRowsBounds() const
+        {
+            return { browserLeft, browserTop + browserHeaderHeight,
+                     getWidth() - browserLeft * 2, browserVisibleRows * browserRowHeight };
+        }
+
+        void scrollBarMoved(juce::ScrollBar*, double start) override
+        {
+            browserScrollIndex = juce::jlimit(0,
+                std::max(0, static_cast<int>(visibleLoopIndices.size()) - browserVisibleRows),
+                static_cast<int>(std::round(start)));
+            repaint();
+            grabKeyboardFocus();
+        }
+
+        void showDiagnostics()
+        {
+            juce::String details = "Bridge: " + juce::String(bridgeEnabled ? "ON" : "OFF")
+                + " | " + (isHostConnected() ? "FL connected" : "Waiting for VST")
+                + "\nListening: " + (listening ? "Yes" : "PORT ERROR")
+                + "\nFL transport: " + (hostPlaying ? "Playing" : "Stopped")
+                + "\nFL BPM: " + juce::String(hostBpm, 2)
+                + " | PPQ: " + juce::String(getEstimatedPpq(), 3)
+                + "\nSample rates (FL / file / device): " + juce::String(hostSampleRate, 0)
+                + " / " + juce::String(sourceSampleRate, 0) + " / " + juce::String(deviceSampleRate.load(), 0)
+                + "\nSource: " + juce::String(sourceBpm, 0) + " BPM / 4 bars"
+                + "\nFile: " + (loadedFileName.isEmpty() ? "None" : loadedFileName)
+                + "\nPreparing: " + (stretching ? "Yes" : "No")
+                + " | Host preview: " + (hostPreviewReady ? "Ready" : "Not ready")
+                + " | Enabled: " + (hostPreviewEnabled ? "Yes" : "No");
+            if (sourceSampleRate > 0.0)
+                details += "\nFile length: " + juce::String(sourceTotalSamples / sourceSampleRate, 3) + "s";
+            if (sourceBpm > 0.0)
+                details += " | Musical length: " + juce::String(loopBeats * 60.0 / sourceBpm, 3) + "s";
+            if (hostPreviewBuffer && stretchedForHostSampleRate > 0.0)
+                details += " | Prepared length: "
+                    + juce::String(hostPreviewBuffer->getNumSamples() / stretchedForHostSampleRate, 3) + "s";
+            details += "\n\n" + gmailStatus;
+            if (gmailClient.getLastRequestError().message.isNotEmpty())
+                details += "\n" + gmailClient.getLastRequestError().message;
+            if (renderError.isNotEmpty()) details += "\n\nPreview: " + renderError;
+            juce::AlertWindow::showMessageBoxAsync(juce::MessageBoxIconType::InfoIcon,
+                                                 "LoopBridge details", details, "Close", this);
+        }
 
         using HostPreviewBuildResult = PreviewRenderer::Result;
         struct CachedPreview
@@ -1347,6 +1274,7 @@ private:
             }
             if (selectedLoopIndex < 0 && !loopItems.empty())
                 selectedLoopIndex = 0;
+            rebuildVisibleLibrary(false);
         }
 
         void startGmailSync()
@@ -1794,36 +1722,10 @@ private:
                 index;
             updatePitchControls();
 
-            if (selectedLoopIndex
-                < browserScrollIndex)
-            {
-                browserScrollIndex =
-                    selectedLoopIndex;
-            }
-            else if (
-                selectedLoopIndex
-                >= browserScrollIndex
-                       + browserVisibleRows)
-            {
-                browserScrollIndex =
-                    selectedLoopIndex
-                    - browserVisibleRows
-                    + 1;
-            }
-
-            const int maxScroll =
-                std::max(
-                    0,
-                    static_cast<int>(
-                        loopItems.size())
-                        - browserVisibleRows);
-
-            browserScrollIndex =
-                juce::jlimit(
-                    0,
-                    maxScroll,
-                    browserScrollIndex);
-
+            const int row = selectedVisibleRow();
+            if (row >= 0 && row < browserScrollIndex) browserScrollIndex = row;
+            else if (row >= browserScrollIndex + browserVisibleRows) browserScrollIndex = row - browserVisibleRows + 1;
+            browserScrollIndex = juce::jlimit(0, std::max(0, static_cast<int>(visibleLoopIndices.size()) - browserVisibleRows), browserScrollIndex);
             const auto& item =
                 loopItems[
                     static_cast<size_t>(
@@ -1839,488 +1741,144 @@ private:
             repaint();
         }
 
-        void drawLoopBrowser(
-            juce::Graphics& g)
+        void drawLoopBrowser(juce::Graphics& g)
         {
-            const int browserWidth =
-                getWidth()
-                - browserLeft * 2;
-
-            const int browserHeight =
-                browserHeaderHeight
-                + browserVisibleRows
-                      * browserRowHeight;
-
-            const juce::Rectangle<int>
-                browserBounds(
-                    browserLeft,
-                    browserTop,
-                    browserWidth,
-                    browserHeight);
-
-            g.setColour(
-                juce::Colour::fromRGB(
-                    26,
-                    28,
-                    32));
-
-            g.fillRoundedRectangle(
-                browserBounds.toFloat(),
-                7.0f);
-
-            g.setColour(
-                juce::Colours::white
-                    .withAlpha(0.12f));
-
-            g.drawRoundedRectangle(
-                browserBounds.toFloat(),
-                7.0f,
-                1.0f);
-
-            g.setFont(
-                juce::Font(
-                    juce::FontOptions(
-                        11.5f,
-                        juce::Font::bold)));
-
-            g.setColour(
-                juce::Colours::white
-                    .withAlpha(0.55f));
-
-            const int playX =
-                browserLeft + 10;
-
-            const int filenameX =
-                browserLeft + 46;
-
-            const int senderX =
-                browserLeft
-                + browserWidth
-                - 460;
-
-            const int bpmX =
-                browserLeft
-                + browserWidth
-                - 300;
-
-            const int keyX =
-                browserLeft
-                + browserWidth
-                - 220;
-
-            const int durationX =
-                browserLeft
-                + browserWidth
-                - 132;
-
-            const int downloadX =
-                browserLeft + browserWidth - 42;
-
-            g.drawText(
-                "LOOP",
-                filenameX,
-                browserTop,
-                senderX
-                    - filenameX
-                    - 10,
-                browserHeaderHeight,
-                juce::Justification::
-                    centredLeft);
-
-            g.drawText(
-                "SENDER",
-                senderX,
-                browserTop,
-                140,
-                browserHeaderHeight,
-                juce::Justification::
-                    centredLeft);
-
-            g.drawText(
-                "BPM",
-                bpmX,
-                browserTop,
-                80,
-                browserHeaderHeight,
-                juce::Justification::
-                    centredLeft);
-
-            g.drawText(
-                "KEY",
-                keyX,
-                browserTop,
-                75,
-                browserHeaderHeight,
-                juce::Justification::
-                    centredLeft);
-
-            g.drawText(
-                "DURATION",
-                durationX,
-                browserTop,
-                76,
-                browserHeaderHeight,
-                juce::Justification::
-                    centredLeft);
-
-            g.setColour(
-                juce::Colours::white
-                    .withAlpha(0.08f));
-
-            g.drawHorizontalLine(
-                browserTop
-                    + browserHeaderHeight,
-                static_cast<float>(
-                    browserLeft),
-                static_cast<float>(
-                    browserLeft
-                    + browserWidth));
-
-            if (loopItems.empty())
+            const auto rows = getBrowserRowsBounds();
+            const auto bounds = rows.withTop(browserTop);
+            const auto columns = getBrowserColumns();
+            const auto text = juce::Colour::fromRGB(226, 229, 234);
+            const auto muted = juce::Colour::fromRGB(139, 145, 155);
+            const auto accent = juce::Colour::fromRGB(139, 179, 166);
+            const auto warning = juce::Colour::fromRGB(218, 169, 112);
+            g.setColour(juce::Colour::fromRGB(23, 26, 31));
+            g.fillRoundedRectangle(bounds.toFloat(), 5.0f);
+            browserScrollbar.setRangeLimits(0.0, std::max(browserVisibleRows, static_cast<int>(visibleLoopIndices.size())),
+                                            juce::dontSendNotification);
+            // Don't overwrite a user scroll while JUCE's asynchronous listener
+            // notification is pending. Push only changes from the browser view.
+            if (displayedScrollStart != browserScrollIndex || displayedScrollRows != browserVisibleRows)
             {
-                g.setColour(
-                    juce::Colours::white
-                        .withAlpha(0.4f));
-
-                g.setFont(
-                    juce::Font(
-                        juce::FontOptions(
-                            13.0f)));
-
-                g.drawText(
-                    gmailClient.getState()
-                            == GmailClient::State::connected
-                        ? "No audio loops found"
-                        : "Connect Gmail to load loops",
-                    browserLeft,
-                    browserTop
-                        + browserHeaderHeight,
-                    browserWidth,
-                    browserVisibleRows
-                        * browserRowHeight,
-                    juce::Justification::
-                        centred);
-
-                return;
+                browserScrollbar.setCurrentRange(browserScrollIndex, browserVisibleRows, juce::dontSendNotification);
+                displayedScrollStart = browserScrollIndex;
+                displayedScrollRows = browserVisibleRows;
+            }
+            // More visible rows must not multiply directory scans on every
+            // bridge timer repaint. This only caches the displayed checkmarks;
+            // actual Download and drag acquisition still check the real files.
+            const auto now = juce::Time::getMillisecondCounterHiRes();
+            if (now - downloadIndicatorsUpdatedMs >= 500.0)
+            {
+                downloadIndicators.clear();
+                downloadIndicatorsUpdatedMs = now;
+            }
+            if (visibleLoopIndices.empty())
+            {
+                g.setColour(muted);
+                g.setFont(juce::Font(juce::FontOptions(13.0f)));
+                g.drawText(gmailClient.getState() == GmailClient::State::connected
+                    ? "No matching loops" : loopItems.empty() ? "Connect Gmail to discover your loops" : "No matching loops",
+                    rows, juce::Justification::centred);
+            }
+            const int endIndex = std::min(browserScrollIndex + browserVisibleRows, static_cast<int>(visibleLoopIndices.size()));
+            for (int visibleRow = browserScrollIndex; visibleRow < endIndex; ++visibleRow)
+            {
+                const int itemIndex = visibleItem(visibleRow);
+                const int rowY = rows.getY() + (visibleRow - browserScrollIndex) * browserRowHeight;
+                const bool selected = itemIndex == selectedLoopIndex;
+                const bool hovered = isMouseOver() && rows.contains(getMouseXYRelative())
+                    && (getMouseXYRelative().y - rows.getY()) / browserRowHeight == visibleRow - browserScrollIndex;
+                if (selected || hovered)
+                {
+                    g.setColour(selected ? juce::Colour::fromRGB(37, 45, 46) : juce::Colour::fromRGB(29, 33, 38));
+                    g.fillRoundedRectangle(static_cast<float>(browserLeft + 4), static_cast<float>(rowY + 3),
+                                           static_cast<float>(bounds.getWidth() - 16), static_cast<float>(browserRowHeight - 6), 6.0f);
+                }
+                const auto& item = loopItems[static_cast<size_t>(itemIndex)];
+                const bool favorite = favoriteProducers.count(LibraryFilter::normalizeProducer(LibraryFilter::producer(item))) > 0;
+                if (favorite || selected || hovered)
+                {
+                    const bool heartHovered = hovered && getMouseXYRelative().x >= columns.favorite
+                        && getMouseXYRelative().x < columns.favorite + 30;
+                    g.setColour(favorite ? juce::Colour::fromRGB(heartHovered ? 238 : 208, heartHovered ? 238 : 208, heartHovered ? 238 : 208)
+                                         : juce::Colour::fromRGB(heartHovered ? 164 : 115, heartHovered ? 164 : 115, heartHovered ? 164 : 115));
+                    // Draw a small monochrome heart rather than a platform-dependent text/emoji glyph.
+                    juce::Path heart;
+                    heart.startNewSubPath(6.0f, 10.5f);
+                    heart.cubicTo(4.5f, 9.0f, 0.0f, 5.8f, 0.0f, 3.0f);
+                    heart.cubicTo(0.0f, -0.5f, 4.4f, -0.8f, 6.0f, 2.0f);
+                    heart.cubicTo(7.6f, -0.8f, 12.0f, -0.5f, 12.0f, 3.0f);
+                    heart.cubicTo(12.0f, 5.8f, 7.5f, 9.0f, 6.0f, 10.5f);
+                    heart.closeSubPath();
+                    heart.applyTransform(juce::AffineTransform::translation(static_cast<float>(columns.favorite + 9),
+                                         static_cast<float>(rowY) + (browserRowHeight - 11) * 0.5f));
+                    if (favorite) g.fillPath(heart);
+                    else g.strokePath(heart, juce::PathStrokeType(1.0f));
+                }
+                const bool thisLoopPlaying = itemIndex == loadedBrowserLoopIndex
+                    && (bridgeEnabled ? isHostConnected() && hostPreviewEnabled && hostPreviewReady && hostPlaying : soloPlaying);
+                g.setColour(thisLoopPlaying ? accent : muted.withAlpha(selected || hovered ? 0.85f : 0.45f));
+                if (thisLoopPlaying)
+                {
+                    g.fillRect(columns.play + 10, rowY + (browserRowHeight - 8) / 2, 2, 8);
+                    g.fillRect(columns.play + 15, rowY + (browserRowHeight - 8) / 2, 2, 8);
+                }
+                else
+                {
+                    juce::Path triangle;
+                    triangle.addTriangle(static_cast<float>(columns.play + 11), static_cast<float>(rowY + (browserRowHeight - 8) / 2),
+                                         static_cast<float>(columns.play + 11), static_cast<float>(rowY + (browserRowHeight + 8) / 2),
+                                         static_cast<float>(columns.play + 18), static_cast<float>(rowY + browserRowHeight / 2));
+                    g.fillPath(triangle);
+                }
+                g.setFont(juce::Font(juce::FontOptions(14.0f, juce::Font::bold)));
+                g.setColour(text.withAlpha(selected ? 1.0f : 0.9f));
+                g.drawText(item.filename, columns.loop, rowY + 5, columns.bpm - columns.loop - 16,
+                           24, juce::Justification::centredLeft);
+                g.setFont(juce::Font(juce::FontOptions(11.5f)));
+                g.setColour(muted);
+                const auto duration = gmailLoopDurations.find(getLoopCacheKey(item));
+                const auto secondary = getSenderDisplayName(item)
+                    + (duration != gmailLoopDurations.end() ? juce::String::fromUTF8(" \xC2\xB7 ") + formatDuration(duration->second) : juce::String{});
+                g.drawText(secondary, columns.loop, rowY + 29, columns.bpm - columns.loop - 16,
+                           18, juce::Justification::centredLeft);
+                g.setFont(juce::Font(juce::FontOptions(12.0f)));
+                g.drawText(item.bpm ? juce::String(*item.bpm, 0) : "--", columns.bpm, rowY,
+                           44, browserRowHeight, juce::Justification::centredLeft);
+                g.drawText(item.key.isNotEmpty() ? item.key : "--", columns.key, rowY,
+                           58, browserRowHeight, juce::Justification::centredLeft);
+                const auto identity = getLoopCacheKey(item);
+                auto indicator = downloadIndicators.find(identity);
+                if (indicator == downloadIndicators.end())
+                    indicator = downloadIndicators.emplace(identity, getDownloadedLoopFile(item).existsAsFile()).first;
+                const bool downloaded = indicator->second;
+                const bool downloading = downloadsInFlight.count(getLoopCacheKey(item)) > 0;
+                if (selected || hovered)
+                {
+                    g.setColour(juce::Colour::fromRGB(49, 57, 61));
+                    g.fillRoundedRectangle(static_cast<float>(columns.download), static_cast<float>(rowY + (browserRowHeight - 30) / 2),
+                                           30.0f, 30.0f, 6.0f);
+                }
+                g.setColour((downloaded ? accent : downloading ? warning : muted).withAlpha(selected || hovered || downloading ? 1.0f : 0.0f));
+                g.setFont(juce::Font(juce::FontOptions(16.0f)));
+                g.drawText(downloaded ? juce::String::fromUTF8("\xE2\x9C\x93") : downloading ? "..." : "+",
+                           columns.download, rowY, 30, browserRowHeight, juce::Justification::centred);
             }
 
-            const int endIndex =
-                std::min(
-                    browserScrollIndex
-                        + browserVisibleRows,
-                    static_cast<int>(
-                        loopItems.size()));
-
-            for (int itemIndex =
-                     browserScrollIndex;
-                 itemIndex < endIndex;
-                 ++itemIndex)
-            {
-                const int visibleIndex =
-                    itemIndex
-                    - browserScrollIndex;
-
-                const int rowY =
-                    browserTop
-                    + browserHeaderHeight
-                    + visibleIndex
-                          * browserRowHeight;
-
-                const bool selected =
-                    itemIndex
-                    == selectedLoopIndex;
-
-                if (selected)
-                {
-                    g.setColour(
-                        juce::Colour::fromRGB(
-                            50,
-                            58,
-                            64));
-
-                    g.fillRect(
-                        browserLeft + 1,
-                        rowY,
-                        browserWidth - 2,
-                        browserRowHeight);
-                }
-                else if (
-                    visibleIndex % 2 != 0)
-                {
-                    g.setColour(
-                        juce::Colours::white
-                            .withAlpha(0.018f));
-
-                    g.fillRect(
-                        browserLeft + 1,
-                        rowY,
-                        browserWidth - 2,
-                        browserRowHeight);
-                }
-
-                const auto& item =
-                    loopItems[
-                        static_cast<size_t>(
-                            itemIndex)];
-
-                g.setFont(
-                    juce::Font(
-                        juce::FontOptions(
-                            12.5f,
-                            selected
-                                ? juce::Font::bold
-                                : juce::Font::plain)));
-
-                g.setColour(
-                    selected
-                        ? juce::Colours::white
-                        : juce::Colours::white
-                              .withAlpha(0.82f));
-
-                const bool thisLoopPlaying =
-                    itemIndex == loadedBrowserLoopIndex
-                    && (bridgeEnabled
-                        ? isHostConnected() && hostPreviewEnabled && hostPreviewReady && hostPlaying
-                        : soloPlaying);
-
-                g.setColour(
-                    thisLoopPlaying
-                        ? juce::Colours::lightgreen
-                        : juce::Colours::cornflowerblue);
-
-                g.setFont(
-                    juce::Font(
-                        juce::FontOptions(
-                            16.0f,
-                            juce::Font::bold)));
-
-                g.drawText(
-                    thisLoopPlaying ? "||" : ">",
-                    playX,
-                    rowY,
-                    28,
-                    browserRowHeight,
-                    juce::Justification::centred);
-
-                g.setFont(
-                    juce::Font(
-                        juce::FontOptions(
-                            12.5f,
-                            selected
-                                ? juce::Font::bold
-                                : juce::Font::plain)));
-
-                g.setColour(
-                    selected
-                        ? juce::Colours::white
-                        : juce::Colours::white.withAlpha(0.82f));
-
-                g.drawFittedText(
-                    item.filename,
-                    filenameX,
-                    rowY,
-                    senderX
-                        - filenameX
-                        - 12,
-                    browserRowHeight,
-                    juce::Justification::
-                        centredLeft,
-                    1);
-
-                g.setColour(
-                    selected
-                        ? juce::Colours::white
-                              .withAlpha(0.9f)
-                        : juce::Colours::white
-                              .withAlpha(0.62f));
-
-                g.drawFittedText(
-                    getSenderDisplayName(
-                        item),
-                    senderX,
-                    rowY,
-                    135,
-                    browserRowHeight,
-                    juce::Justification::
-                        centredLeft,
-                    1);
-
-                const juce::String bpmText =
-                    item.bpm.has_value()
-                        ? juce::String(
-                              *item.bpm,
-                              0)
-                        : "--";
-
-                g.setColour(
-                    item.bpm.has_value()
-                        ? juce::Colours::
-                              lightgreen
-                        : juce::Colours::white
-                              .withAlpha(0.3f));
-
-                g.drawText(
-                    bpmText,
-                    bpmX,
-                    rowY,
-                    70,
-                    browserRowHeight,
-                    juce::Justification::
-                        centredLeft);
-
-                const juce::String keyText =
-                    item.key.isNotEmpty()
-                        ? item.key
-                        : "--";
-
-                g.setColour(
-                    item.key.isNotEmpty()
-                        ? juce::Colours::
-                              lightgreen
-                        : juce::Colours::white
-                              .withAlpha(0.3f));
-
-                g.drawFittedText(
-                    keyText,
-                    keyX,
-                    rowY,
-                    75,
-                    browserRowHeight,
-                    juce::Justification::
-                        centredLeft,
-                    1);
-
-                const auto durationIt =
-                    gmailLoopDurations.find(
-                        getLoopCacheKey(item));
-
-                const juce::String durationText =
-                    durationIt != gmailLoopDurations.end()
-                        ? formatDuration(durationIt->second)
-                        : "--";
-
-                g.setColour(
-                    durationIt != gmailLoopDurations.end()
-                        ? juce::Colours::white.withAlpha(0.72f)
-                        : juce::Colours::white.withAlpha(0.3f));
-
-                g.drawText(
-                    durationText,
-                    durationX,
-                    rowY,
-                    76,
-                    browserRowHeight,
-                    juce::Justification::centredLeft);
-
-                const bool downloaded =
-                    getDownloadedLoopFile(item).existsAsFile();
-                const bool downloading =
-                    downloadsInFlight.count(getLoopCacheKey(item)) > 0;
-
-                g.setColour(
-                    downloaded ? juce::Colours::lightgreen
-                    : downloading ? juce::Colours::orange
-                                  : juce::Colours::cornflowerblue);
-                g.setFont(juce::Font(juce::FontOptions(
-                    18.0f, juce::Font::bold)));
-                g.drawText(
-                    downloaded ? juce::String::fromUTF8("\xE2\x9C\x93")
-                    : downloading ? "..." : "+",
-                    downloadX,
-                    rowY,
-                    30,
-                    browserRowHeight,
-                    juce::Justification::centred);
-
-                g.setColour(
-                    juce::Colours::white
-                        .withAlpha(0.045f));
-
-                g.drawHorizontalLine(
-                    rowY
-                        + browserRowHeight
-                        - 1,
-                    static_cast<float>(
-                        browserLeft + 8),
-                    static_cast<float>(
-                        browserLeft
-                        + browserWidth
-                        - 8));
-            }
-
-            if (selectedLoopIndex >= 0
-                && selectedLoopIndex
-                       < static_cast<int>(
-                           loopItems.size()))
-            {
-                const auto& selected =
-                    loopItems[
-                        static_cast<size_t>(
-                            selectedLoopIndex)];
-
-                g.setColour(
-                    juce::Colours::white
-                        .withAlpha(0.45f));
-
-                g.setFont(
-                    juce::Font(
-                        juce::FontOptions(
-                            11.0f)));
-
-                const juce::String positionText =
-                    juce::String(
-                        selectedLoopIndex + 1)
-                    + " / "
-                    + juce::String(
-                        static_cast<int>(
-                            loopItems.size()));
-
-                g.drawText(
-                    positionText,
-                    browserLeft,
-                    browserTop
-                        + browserHeight
-                        + 6,
-                    browserWidth,
-                    20,
-                    juce::Justification::
-                        centredRight);
-
-                juce::String metadataText =
-                    "Selected: "
-                    + selected.filename;
-
-                if (selected.bpm.has_value())
-                {
-                    metadataText +=
-                        "  |  "
-                        + juce::String(
-                            *selected.bpm,
-                            0)
-                        + " BPM";
-                }
-
-                if (selected.key.isNotEmpty())
-                {
-                    metadataText +=
-                        "  |  "
-                        + selected.key;
-                }
-
-                g.drawFittedText(
-                    metadataText,
-                    browserLeft,
-                    browserTop
-                        + browserHeight
-                        + 6,
-                    browserWidth - 90,
-                    20,
-                    juce::Justification::
-                        centredLeft,
-                    1);
-            }
+            juce::String status;
+            bool attention = false;
+            if (!listening) { status = "FL connection port unavailable. Open details."; attention = true; }
+            else if (renderError.isNotEmpty()) { status = renderError; attention = true; }
+            else if (gmailStatus.containsIgnoreCase("ERROR") || gmailStatus.containsIgnoreCase("PAUSED"))
+                { status = gmailStatus; attention = true; }
+            else if (pendingBrowserPreview.isNotEmpty() || stretching) status = "Preparing preview...";
+            else if (gmailClient.isLibrarySyncActive()) status = "Syncing Gmail in the background...";
+            else if (bridgeEnabled && hostPreviewEnabled && hostPreviewReady && !hostPlaying)
+                status = "Ready. Start FL transport to preview.";
+            g.setColour(attention ? warning : muted);
+            g.setFont(juce::Font(juce::FontOptions(11.0f)));
+            g.drawText(status, browserLeft, bounds.getBottom() + 3, bounds.getWidth() - 86,
+                       20, juce::Justification::centredLeft);
         }
-
         void chooseAudioFile()
         {
             fileChooser =
@@ -2377,7 +1935,8 @@ private:
                 && selectedLoopIndex >= 0 && selectedLoopIndex < static_cast<int>(loopItems.size()))
                 key = loopItems[static_cast<size_t>(selectedLoopIndex)].musicalKey;
             const int pitch = effectivePitch(key, manualSemitones);
-            pitchLabel.setText((pitch > 0 ? "+" : "") + juce::String(pitch) + " st", juce::dontSendNotification);
+            pitchLabel.setText((manualSemitones > 0 ? "+" : "") + juce::String(manualSemitones) + " st",
+                               juce::dontSendNotification);
             pitchLabel.setJustificationType(juce::Justification::centred);
             pitchMinus.setEnabled(pitch > -12);
             pitchPlus.setEnabled(pitch < 12);
@@ -2385,9 +1944,10 @@ private:
                 : keySyncButton.getToggleState() && key->minor != projectKey().minor
                     ? "Mode mismatch: manual only" : "", juce::dontSendNotification);
             keyStatusLabel.setColour(juce::Label::textColourId, juce::Colours::white.withAlpha(0.6f));
-            pitchLabel.setTooltip(!key ? "Unknown source key: manual pitch only"
+            pitchLabel.setTooltip("Manual: " + juce::String(manualSemitones) + " st | Effective: "
+                + juce::String(pitch) + " st\n" + (!key ? "Unknown source key: manual pitch only"
                 : keySyncButton.getToggleState() && key->minor != projectKey().minor
-                    ? "Major/minor mismatch: manual pitch only" : "Effective preview pitch shift");
+                    ? "Major/minor mismatch: manual pitch only" : "Includes Key Sync when enabled"));
         }
 
         void adjustManualPitch(int direction)
@@ -2485,7 +2045,10 @@ private:
             sourceTotalSamples = static_cast<int>(reader->lengthInSamples);
             sourceMusicalSamples = sourceBpm > 0.0 ? std::min(sourceTotalSamples,
                 static_cast<int>(std::llround(loopBeats * 60.0 / sourceBpm * sourceSampleRate))) : sourceTotalSamples;
-            loadedFileName = file.getFileName();
+            loadedFileName = identity.isEmpty() ? file.getFileName() : juce::String{};
+            if (identity.isNotEmpty())
+                for (const auto& item : loopItems)
+                    if (getLoopCacheKey(item) == identity) { loadedFileName = item.filename; break; }
             updatePitchControls();
             // The browser callback installs its loaded index immediately after
             // this returns. All decoding/rendering is deferred to the worker.
@@ -3079,6 +2642,8 @@ private:
                 playButton.setEnabled(sourceMusicalSamples > 0);
                 stopButton.setEnabled(soloPreviewIntent);
             }
+
+            playButton.setTooltip(playButton.getButtonText());
 
             if (pendingPrefetchCentre >= 0)
             {

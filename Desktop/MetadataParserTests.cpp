@@ -1,4 +1,5 @@
 #include "MetadataParser.h"
+#include "LibraryFilter.h"
 
 #include <cmath>
 #include <iostream>
@@ -343,6 +344,48 @@ int main()
     const auto cs = MetadataParser::musicalKeyFromLabel("C# minor");
     const auto db = MetadataParser::musicalKeyFromLabel("Db minor");
     check(cs && db && cs->pitchClass == db->pitchClass, "Enharmonic equivalence");
+
+    check(LibraryFilter::normalizeProducer("  SeekyBeats  ") == "seekybeats", "Favorite producer normalization");
+    std::vector<LoopItem> library(4);
+    library[0].filename = "fort knox Am 155bpm.mp3";
+    library[0].senderName = " SeekyBeats ";
+    library[1].filename = "fearless.wav";
+    library[1].senderName = "someone else";
+    library[2].filename = "FEARLESS remix.wav";
+    library[2].senderName = "seekybeats";
+    library[3].filename = "hall.wav";
+    library[3].senderEmail = "other@example.com";
+    const std::set<juce::String> favorites { "seekybeats" };
+    check(LibraryFilter::visibleItems(library, favorites, false, "") == std::vector<int>({0, 1, 2, 3}), "All preserves library order");
+    check(LibraryFilter::visibleItems(library, favorites, true, "") == std::vector<int>({0, 2}), "Favorites share normalized producer state");
+    check(LibraryFilter::visibleItems(library, favorites, false, "fearLESS") == std::vector<int>({1, 2}), "Case insensitive title search");
+    check(LibraryFilter::visibleItems(library, favorites, false, "SEEKY") == std::vector<int>({0, 2}), "Producer search");
+    check(LibraryFilter::visibleItems(library, favorites, false, "example.com") == std::vector<int>({3}), "Sender email search");
+    const auto filtered = LibraryFilter::visibleItems(library, favorites, true, "fearless");
+    check(filtered == std::vector<int>({2}), "Favorites and search combine");
+    check(LibraryFilter::underlyingIndex(filtered, 0) == 2
+        && LibraryFilter::underlyingIndex(filtered, -1) == -1
+        && LibraryFilter::underlyingIndex(filtered, 1) == -1, "Visible row mapping rejects invalid indices");
+    check(LibraryFilter::visibleItems(library, favorites, true, "missing").empty(), "Empty filter results");
+    check(library[2].filename == "FEARLESS remix.wav" && library[0].senderName == " SeekyBeats ", "Filtering leaves library identities unchanged");
+    juce::Array<juce::var> savedProducers;
+    for (const auto& name : favorites) savedProducers.add(name);
+    const auto restoredJson = juce::JSON::parse(juce::JSON::toString(juce::var(savedProducers)));
+    std::set<juce::String> restoredProducers;
+    if (const auto* names = restoredJson.getArray())
+        for (const auto& name : *names) restoredProducers.insert(LibraryFilter::normalizeProducer(name.toString()));
+    check(restoredProducers == favorites, "Favorite producer persistence JSON round trip");
+    auto removedFavorites = restoredProducers;
+    removedFavorites.erase(LibraryFilter::normalizeProducer(LibraryFilter::producer(library[2])));
+    check(LibraryFilter::visibleItems(library, removedFavorites, true, "").empty(),
+          "Unfavoriting another loop removes the entire producer");
+    check(LibraryFilter::visibleItems(library, removedFavorites, false, "") == std::vector<int>({0, 1, 2, 3}),
+          "All restores every loop after unfavoriting");
+    const auto favoriteRows = LibraryFilter::visibleItems(library, favorites, true, "");
+    check(LibraryFilter::underlyingIndex(favoriteRows, 0) == 0
+        && LibraryFilter::underlyingIndex(favoriteRows, 1) == 2
+        && LibraryFilter::underlyingIndex(favoriteRows, 2) == -1,
+        "Filtered navigation/action mapping skips nonfavorite library items");
 
     std::cout
         << "================================\n"
